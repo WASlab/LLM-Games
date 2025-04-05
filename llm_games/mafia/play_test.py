@@ -45,7 +45,7 @@ quick_config = {
     # Override or add any other configuration options:
     "max_steps": 200,  # Increase max steps if needed to allow game termination.
     # For testing, we force the environment to transition to day immediately:
-    "force_day_on_start": True  
+    #"force_day_on_start": True  
 }
 
 # An empty agent config (could be extended later)

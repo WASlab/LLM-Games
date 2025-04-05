@@ -1,5 +1,3 @@
-# === mafia/simulation.py ===
-
 import os
 import json
 import uuid
@@ -7,16 +5,15 @@ from typing import Dict, List, Optional
 
 from tqdm import tqdm
 
-# Import your environment and other needed modules
 from llm_games.mafia.environment import MafiaEnvironment
 from llm_games.mafia.player import Player
-from llm_games.mafia.mechanics.roles import get_role_class, Role
+from llm_games.mafia.mechanics.roles import get_role_class
 from llm_games.mafia.agents.rule_agent import RuleAgent
-from llm_games.mafia.agents.llm_agent import LLMAgent  # Or your chosen LLM agent implementation
+from llm_games.mafia.agents.llm_agent import LLMAgent
+from llm_games.mafia.enums import GamePhase
 
-# Dummy Token Tracker if needed
+
 class TokenTracker:
-    """Placeholder for optional token counting or other usage stats."""
     def __init__(self):
         self.usage = {}
 
@@ -26,42 +23,15 @@ class TokenTracker:
     def to_dict(self) -> Dict[str, Dict[str, int]]:
         return self.usage
 
+
 def load_config_from_file(path: str) -> Dict:
-    """
-    Loads the configuration from a JSON or YAML file.
-    For demonstration, returns a stub if not implemented.
-    """
-    print(f"Attempting to load config from {path} (placeholder).")
-    # Real implementation might do:
-    #   with open(path, "r") as f:
-    #       return json.load(f)
+    print(f"Attempting to load config from {path} (stub).")
     return {}
 
+
 def create_players_from_config(config: Dict) -> List[Player]:
-    """
-    Creates Player objects with assigned roles and agents based on the config.
-    Example config structure:
-    {
-      "roles": [
-        {"name": "Player1", "role": "Cop"},
-        {"name": "Player2", "role": "Doctor"},
-        ...
-      ],
-      "agent_mapping": {
-        "Player1": "llm",
-        "Player4": "llm"
-      },
-      "llm_config": {
-        "model": "gpt-3.5-turbo",
-        ...
-      },
-      ...
-    }
-    """
     players = []
     roles_config = config.get("roles", [])
-
-    # Fallback to a default 5-player setup if no roles provided
     if not roles_config:
         roles_setup = [
             ("Player1", "Cop"),
@@ -78,22 +48,20 @@ def create_players_from_config(config: Dict) -> List[Player]:
         RoleClass = get_role_class(role_name)
         if not RoleClass:
             raise ValueError(f"Unknown role name '{role_name}' in configuration.")
-        role_instance = RoleClass()  # e.g., Cop(), Doctor()
-
-        # Create the Player object
+        role_instance = RoleClass()
         player = Player(name=name, role=role_instance)
 
-        # Agent assignment logic
-        agent_type = config.get("agent_mapping", {}).get(name, "rule").lower()  # default 'rule'
+        agent_type = config.get("agent_mapping", {}).get(name, "rule").lower()
         if agent_type == "llm":
-            # Get additional details if available
             model_name = config.get("llm_config", {}).get("model", "gpt-3.5-turbo")
-            system_prompt = f"You are {name}, playing Mafia as {role_instance.name}. {role_instance.get_role_description()}"
-            
-            # Dummy model backend for testing
+            system_prompt = (
+                f"You are {name}, playing Mafia as {role_instance.name}. "
+                f"{role_instance.get_role_description()}"
+            )
+
             def dummy_model_backend(prompt: str) -> str:
                 return '{"action": "pass"}'
-            
+
             agent = LLMAgent(
                 name=name,
                 model_backend=dummy_model_backend,
@@ -102,9 +70,8 @@ def create_players_from_config(config: Dict) -> List[Player]:
             )
             print(f"Assigning LLM-based Agent to {name} ({role_name})")
         else:
-            # Default to a rule-based agent
             strategy = config.get("agent_strategy", {})
-            agent = RuleAgent(name=name, player_role=role_instance.name, strategy=strategy)
+            agent = RuleAgent(name=name, role=role_instance.name, strategy=strategy)
             print(f"Assigning RuleAgent to {name} ({role_name})")
 
         player.agent = agent
@@ -112,10 +79,8 @@ def create_players_from_config(config: Dict) -> List[Player]:
 
     return players
 
+
 def log_game_summary(game_state) -> Dict:
-    """
-    Summarizes final game results.
-    """
     return {
         "game_id": game_state.game_id,
         "winner": game_state.winner.value if game_state.winner else None,
@@ -123,27 +88,19 @@ def log_game_summary(game_state) -> Dict:
         "day_count": game_state.day_count
     }
 
+
 def run_simulation(game_config: Dict, agent_config: Dict) -> Dict:
-    """
-    Runs a single Mafia game simulation with the specified configuration and agent settings.
-    Returns a summary dictionary of the final game state.
-    """
+    print(f"\n--- Starting Simulation Game ID: {game_config.get('game_id', 'N/A')} ---")
     combined_config = {**game_config, "agents": agent_config}
 
-    # 1. Create players
     players = create_players_from_config(combined_config)
-
-    # 2. Create environment
     env = MafiaEnvironment(players=players, config=combined_config)
 
-    # For quick testing, force the initial phase to DAY_DISCUSSION if desired.
-    if env.state.phase == env.state.phase.__class__.NIGHT:
-        print("Forcing initial phase to DAY_DISCUSSION for testing.")
-        env._transition_to_day()
+    if env.state.phase != GamePhase.NIGHT:
+        env.state.phase = GamePhase.NIGHT
+    print("Game begins at Night (Day 0). Agents may converse/pass; initial kills occur here if applicable.")
 
     token_tracker = TokenTracker()
-
-    # 3. Main game loop
     max_steps = combined_config.get("max_steps", 100)
     step_count = 0
 
@@ -151,21 +108,36 @@ def run_simulation(game_config: Dict, agent_config: Dict) -> Dict:
         step_count += 1
         print(f"\n=== [Step {step_count}] Day {env.state.day_count}, Phase: {env.state.phase.name}, Turn: {env.state.turn_number_in_phase} ===")
 
+        current_phase = env.state.phase
         current_player_name = env.get_current_player_name()
+
+        # Final vote is non-turn-based: every alive player votes
+        if current_phase == GamePhase.FINAL_VOTE:
+            for name in env.state.alive_players:
+                player = env.state.get_player(name)
+                if not player or not player.alive:
+                    continue
+                obs = env.get_observation(name)
+                player.agent.observe(obs)
+                act = player.agent.act()
+                print(f"{name} votes: {act}")
+                env.process_player_action(name, act)
+            env.step_phase()
+            continue
+
+        # Other phases
         if not current_player_name:
-            # No current player; advance phase
+            print("No current player; environment resolving phase...")
             env.step_phase()
             continue
 
         player = env.state.get_player(current_player_name)
         if not player or not player.alive:
+            print(f"Skipping turn for {current_player_name} (dead or invalid).")
             env.advance_turn()
             continue
 
-        # Build observation for the current player
         observation = env.get_observation(current_player_name)
-
-        # Ensure agent observes the environment first
         agent = player.agent
         agent.observe(observation)
         agent_action = agent.act()
@@ -174,9 +146,8 @@ def run_simulation(game_config: Dict, agent_config: Dict) -> Dict:
         success = env.process_player_action(current_player_name, agent_action)
         if not success:
             print(f"Action failed or was invalid: {agent_action}")
-
-        # Optionally update token usage
-        # token_tracker.update(current_player_name, observation, agent_action)
+        else:
+            env.advance_turn()
 
     print("\n=== Game Over ===")
     winner_str = env.state.winner.value if env.state.winner else "No winner / Undecided"
@@ -187,12 +158,10 @@ def run_simulation(game_config: Dict, agent_config: Dict) -> Dict:
     summary["tokens_used"] = token_tracker.to_dict()
     return summary
 
+
 def run_multiple_simulations(num_games: int = 5,
                              config_path: str = "config/default_game.json",
                              save_dir: str = "output/sim_results"):
-    """
-    Runs multiple simulations, saving results as JSON Lines.
-    """
     os.makedirs(save_dir, exist_ok=True)
     base_game_config = load_config_from_file(config_path)
     if not base_game_config:
@@ -208,9 +177,7 @@ def run_multiple_simulations(num_games: int = 5,
                 "Player1": "llm",
                 "Player4": "llm"
             },
-            "llm_config": {
-                "model": "gpt-3.5-turbo"
-            },
+            "llm_config": {"model": "gpt-3.5-turbo"},
             "max_steps": 100
         }
     base_agent_config = {}
@@ -221,7 +188,6 @@ def run_multiple_simulations(num_games: int = 5,
     for _ in tqdm(range(num_games), desc="Simulating Games"):
         game_id = str(uuid.uuid4())
         current_game_config = {**base_game_config, "game_id": game_id}
-
         try:
             result = run_simulation(current_game_config, base_agent_config)
             result["game_id"] = game_id
@@ -230,22 +196,19 @@ def run_multiple_simulations(num_games: int = 5,
                 json.dump(result, f)
                 f.write("\n")
         except Exception as e:
-            print(f"Error in simulation {game_id}: {e}")
-            error_info = {
-                "game_id": game_id,
-                "error": str(e),
-                "status": "error"
-            }
+            print(f"\n!!!!!! Error during simulation {game_id} !!!!!!")
+            print(f"Error: {e}")
+            error_info = {"game_id": game_id, "status": "error", "error_message": str(e)}
             with open(log_file, "a", encoding="utf-8") as f:
                 json.dump(error_info, f)
                 f.write("\n")
 
-    print(f"\n=== Simulations Complete ===\nLogs saved to {log_file}")
-    # Optionally perform aggregate analysis here
+    print(f"\n=== Simulations Complete ===\nSaved {len(game_results)} game logs to {log_file}")
+
 
 def main():
-    """CLI entrypoint for running simulations."""
     run_multiple_simulations(num_games=3)
+
 
 if __name__ == "__main__":
     main()

@@ -375,15 +375,8 @@ class GameState:
     # ----------------------------------------------------------------
 
     def get_player_observation(self, player_name: str) -> Dict[str, Any]:
-        """
-        Generates a viewpoint for one player, containing:
-          - visible (public + relevant private) messages
-          - personal flags (roleblocked, protected, memory)
-          - day/phase details
-        """
         player = self.get_player(player_name)
         if not player or not player.alive:
-            # Alternatively, return a 'You are dead' prompt
             return {
                 "game_id": self.game_id,
                 "player_name": player_name,
@@ -391,36 +384,27 @@ class GameState:
                 "message": "You are no longer in the game."
             }
 
-        # Gather messages visible to this player
-        visible_messages: List[str] = []
-        for msg_obj in self.messages:
-            if not isinstance(msg_obj, GameMessage):
-                # Optionally print or log what went wrong
-                self.log_hidden(player_name, f"Invalid message object (type={type(msg_obj)}): {msg_obj}")
-                continue  # Skip any malformed message
-            is_recip_private = (msg_obj.recipients is not None and player_name in msg_obj.recipients)
-            is_sender_private = (msg_obj.sender == player_name and msg_obj.recipients is not None)
-            if (msg_obj.recipients is None) or is_recip_private or is_sender_private:
-                # Format differently if it's a whisper or if they are the sender
-                if msg_obj.msg_type == "whisper":
+        visible_messages = []
+        for msg in self.messages:
+            is_recip_private = (msg.recipients is not None and player_name in msg.recipients)
+            is_sender_private = (msg.sender == player_name and msg.recipients is not None)
+            if (msg.recipients is None) or is_recip_private or is_sender_private:
+                if msg.msg_type == "whisper":
                     if is_sender_private:
-                        # From self to someone else
-                        visible_messages.append(
-                            f"(Whisper to {msg_obj.recipients[0]}) {msg_obj.content}"
-                        )
+                        visible_messages.append(f"(Whisper to {msg.recipients[0]}) {msg.content}")
                     elif is_recip_private:
-                        # A whisper from someone else to you
-                        visible_messages.append(
-                            f"(Whisper from {msg_obj.sender}) {msg_obj.content}"
-                        )
+                        visible_messages.append(f"(Whisper from {msg.sender}) {msg.content}")
                     else:
-                        # Shouldn't happen with typed logs, but just in case
-                        visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
+                        visible_messages.append(f"{msg.sender}: {msg.content}")
                 else:
-                    # Normal or system message
-                    visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
+                    visible_messages.append(f"{msg.sender}: {msg.content}")
 
-        # Construct final observation
+        # For mafia players, include the list of alive mafia members
+        if player.faction == Faction.MAFIA:
+            mafia_members = [p.name for p in self.players if p.alive and p.faction == Faction.MAFIA]
+        else:
+            mafia_members = []
+
         obs = {
             "game_id": self.game_id,
             "player_name": player.name,
@@ -431,9 +415,9 @@ class GameState:
             "day": self.day_count,
             "turn": self.turn_number_in_phase,
             "is_current_turn": (self.current_player_turn == player.name),
-            "alive_players": sorted(self.alive_players),
-            "dead_players": sorted(self.dead_players),
-            "messages": visible_messages[-20:],  # Limit message history
+            "alive_players": sorted(list(self.alive_players)),
+            "dead_players": sorted(list(self.dead_players)),
+            "messages": visible_messages[-20:],
             "can_speak": player.can_speak(),
             "can_act_tonight": (player.can_act_at_night() and self.phase == GamePhase.NIGHT),
             "player_on_trial": self.player_on_trial,
@@ -442,12 +426,11 @@ class GameState:
             "memory": list(player.memory),
             "is_roleblocked": player.is_roleblocked,
             "protected_by": player.protected_by,
-            # Example: "token_budget": self.discussion_token_budgets.get(player.name, 0),
-            "lynch_votes": {
-                voter: val for voter, val in self.votes_for_lynch.items()
-            },  # Show final vote states
+            "lynch_votes": {voter: val for voter, val in self.votes_for_lynch.items()},
+            "mafia_members": mafia_members
         }
         return obs
+
 
     # ----------------------------------------------------------------
     # Optional: Phase Tracking for Debug or Time-Aware Agents
