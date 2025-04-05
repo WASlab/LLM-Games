@@ -24,107 +24,545 @@ class VoteType(Enum):
     SKIP = "skip" # Abstain from voting
 
 # === environment.py ===
-# mafia/environment.py
-from typing import Dict, List, Optional
+# === Updated mafia/environment.py ===
+import random
+from collections import deque
+from typing import Dict, List, Optional, Any, Tuple
+
+# Use correct imports based on unified role system and previous refactoring
 from mafia.game_state import GameState
 from mafia.player import Player
-from mafia.enums import Phase
-from mafia.rewards import compute_rewards
-from mafia.utils.token_cost import track_tokens
+from mafia.enums import GamePhase, Faction
+# Import specific roles if needed for logic (e.g., Cop speaks first)
+from mafia.mechanics.roles import Cop
+# Assume rewards and token tracking utilities exist
+# from mafia.rewards import compute_rewards, assign_vote_reward, ...
+# from mafia.utils.token_cost import track_tokens # If using
+
+# Dummy Token Tracker if not implemented
+class TokenTracker:
+    def __init__(self): self.usage = {}
+    def update(self, *args, **kwargs): pass
+    def to_dict(self): return self.usage
+
+# Dummy compute_rewards if not implemented
+def compute_rewards(state): return {}
 
 class MafiaEnvironment:
-    def __init__(self, players: List[Player]):
-        self.state = GameState(players=players)
+    """
+    Manages the overall flow, phases, and action resolution of a Mafia game.
+    """
+    def __init__(self, players: List[Player], config: Dict[str, Any]):
+        self.config = config
+        # Ensure players list is shuffled initially unless order matters for setup
+        # random.shuffle(players)
+        self.state = GameState(players=players, game_config=config)
         self.state.initialize()
 
-    def step(self):
-        if self.state.phase == Phase.NIGHT:
+        # Turn management for day phase
+        self._speaker_queue: deque[str] = deque()
+        self._question_queue: deque[Tuple[str, str]] = deque() # (Questioner, Questioned) tuples
+        self._turns_taken_this_round: Set[str] = set() # Track who spoke in current round-robin
+        self._consecutive_passes: int = 0
+
+        # Configuration flags
+        self.lynch_defense_enabled: bool = self.config.get("lynch_defense_enabled", True)
+        self.cop_speaks_first: bool = self.config.get("cop_speaks_first", False)
+        # Add token budget config if using tokens
+
+        self.token_tracker = TokenTracker() # If using
+
+    # --- Core Simulation Interface ---
+
+    def step_phase(self) -> bool:
+        """
+        Advances the game by one logical phase or step.
+        Returns True if the game ended, False otherwise.
+        """
+        if self.state.game_over:
+            return True
+
+        current_phase = self.state.phase
+
+        if current_phase == GamePhase.NIGHT:
             self._resolve_night()
             self._transition_to_day()
-        elif self.state.phase == Phase.DAY:
-            self._resolve_day()
+        elif current_phase == GamePhase.DAY_DISCUSSION:
+            # Day discussion is more complex, managed turn-by-turn
+            # The simulation loop should call process_player_action or advance_turn
+            # This method might just check if discussion should end and transition
+            if self._check_discussion_end():
+                self._transition_to_voting() # Or trial if accusation happened
+        elif current_phase == GamePhase.VOTING:
+            # Logic to handle voting actions if needed, or transition after timer/all voted
+            # For simplicity, assume voting logic is handled within _resolve_day/process_player_action
+             pass # Voting might resolve as part of day discussion end
+        elif current_phase == GamePhase.DEFENSE:
+            # Handle defense turn
+            self._run_defense() # Let accused speak
+            self._transition_to_final_vote()
+        elif current_phase == GamePhase.FINAL_VOTE:
+            # Handle final lynch votes
+            self._resolve_lynch() # Use final votes
             self._transition_to_night()
-        return self._get_observations(), self.state.ended
+        # Add other phases if necessary
 
-    def _resolve_night(self):
-        self.state.resolve_night_actions()
+        # Check for game end after phase actions
+        return self.state.check_game_end()
 
-    def _transition_to_day(self):
-        self.state.phase = Phase.DAY
-        self.state.day_count += 1
-        self.state.reset_votes()
-        self.state.reset_discussion_state()
-        for player in self.state.players:
-            player.reset_day_state()
 
-    def _resolve_day(self):
-        self._process_votes()
+    def get_current_player_name(self) -> Optional[str]:
+        """Returns the name of the player whose turn it is to act."""
+        return self.state.current_player_turn
 
-    def _transition_to_night(self):
-        self.state.phase = Phase.NIGHT
-        for player in self.state.players:
-            player.reset_night_state()
+    def get_observation(self, player_name: str) -> Dict[str, Any]:
+        """Generates the observation for the specified player."""
+        return self.state.get_player_observation(player_name)
 
-    def _process_votes(self):
-        votes = self.state.voting_targets
-        if not votes:
+    def advance_turn(self):
+        """Advances to the next player's turn during the day discussion."""
+        if self.state.phase != GamePhase.DAY_DISCUSSION:
+            self.state.current_player_turn = None
             return
-        max_votes = max(votes.values())
-        candidates = [name for name, count in votes.items() if count == max_votes]
-        if len(candidates) == 1:
-            accused = candidates[0]
-            self.state.accused_player = accused
-            self._process_lynch(accused)
 
-    def _process_lynch(self, accused: str):
-        confirm_votes = list(self.state.lynch_confirm_votes.values())
-        if not confirm_votes:
+        # Prioritize question queue
+        if self._question_queue:
+            questioner, questioned = self._question_queue.popleft()
+            # Questioned player speaks next
+            self.state.current_player_turn = questioned
+            self.state.log_hidden("system", f"Turn advanced to {questioned} (answering {questioner})")
+            # We might need state to know they are answering a question
+            self.state.turn_context = {"answering_question_from": questioner}
             return
-        if sum(confirm_votes) > len(confirm_votes) // 2:
-            self.state.kill_player(accused)
-            self.state.log_hidden(accused, f"Lynched on Day {self.state.day_count}")
 
-    def _get_observations(self) -> Dict[str, Dict]:
-        obs = {}
-        for player in self.state.players:
-            if player.alive:
-                obs[player.name] = {
-                    "phase": self.state.phase.name,
-                    "day": self.state.day_count,
-                    "alive": list(self.state.alive_players),
-                    "dead": list(self.state.dead_players),
-                    "messages": self.state.messages[-10:],
-                    "can_speak": player.can_speak(),
-                    "accused": self.state.accused_player,
-                    "votes": self.state.voting_targets,
-                    "token_budget": self.state.discussion_token_budgets.get(player.name, 0)
-                }
-        return obs
+        # If no questions pending, continue normal speaker queue
+        self.state.turn_context = None # Clear context
+        if not self._speaker_queue:
+            # If queue is empty, check if discussion should end or start new round
+            if self._check_discussion_end():
+                self._transition_to_voting()
+                return
+            else:
+                 # Start a new round-robin
+                self._start_new_discussion_round()
+                if not self._speaker_queue: # No one left to speak
+                     self._transition_to_voting()
+                     return
 
-    def act(self, name: str, action: str, target: Optional[str] = None, content: Optional[str] = None):
-        player = self.state.get_player(name)
-        if not player or not player.alive:
-            return False
+        # Get next speaker from queue
+        next_speaker = self._speaker_queue.popleft()
+        self.state.current_player_turn = next_speaker
+        self.state.turn_number_in_phase += 1 # Increment turn counter
+        self.state.log_hidden("system", f"Turn advanced to {next_speaker}")
 
+
+    def process_player_action(self, player_name: str, action: Dict[str, Any]) -> bool:
+        """Processes an action submitted by a player's agent."""
+        player = self.state.get_player(player_name)
+        if not player or not player.alive or self.state.current_player_turn != player_name:
+            self.state.log_hidden(player_name, f"Attempted action {action} but not their turn or dead.")
+            return False # Not their turn or player invalid
+
+        action_type = action.get("action")
+        target = action.get("target")
+        content = action.get("content")
         success = False
-        if action == "accuse" and target:
-            success = player.accuse(target, self.state)
-        elif action == "predict" and target and content:
-            success = player.predict_role(target, content, self.state)
-        elif action == "question" and target and content:
-            success = player.question(target, content, self.state)
-        elif action == "whisper" and target and content:
-            success = player.whisper(target, content, self.state)
-        elif action == "vote" and target:
-            success = player.vote_for(target, self.state)
 
+        self.state.log_hidden(player_name, f"Received action: {action}")
+        self.token_tracker.update(player_name, action_type, content) # Track tokens/action
+
+        # --- Night Actions ---
+        if self.state.phase == GamePhase.NIGHT:
+            if player.can_act_at_night():
+                # Agent should decide target, store it, environment reads it here?
+                # Or action dict contains target directly
+                player.night_target = target # Store target chosen by agent
+                # Submit the *intended* action based on role, Environment resolves later
+                intended_action = player.perform_night_action(self.state)
+                if intended_action:
+                    self.state.register_night_action(player_name, intended_action)
+                    success = True
+                else:
+                     self.state.log_hidden(player_name, "Submitted no valid night action or was blocked.")
+                     # Still counts as their turn ending
+                     success = True # Turn processed, even if no action
+            else:
+                 self.state.log_hidden(player_name,"Attempted night action, but role cannot act.")
+                 success = True # Turn processed
+
+        # --- Day Discussion Actions ---
+        elif self.state.phase == GamePhase.DAY_DISCUSSION:
+            self._consecutive_passes = 0 # Reset pass counter on any action other than pass
+            if action_type == "pass":
+                self.state.log_message(player_name, f"{player_name} passes.")
+                self._consecutive_passes += 1
+                success = True
+            elif action_type == "accuse" and target:
+                # Check if an accusation has already happened this day if limiting
+                if self.state.player_on_trial:
+                     self.state.log_hidden(player_name, "Tried to accuse, but someone is already on trial.")
+                else:
+                    success = player.accuse(target, self.state)
+                    if success:
+                        # Accusation successful, potentially triggers voting phase
+                        self.state.player_on_trial = target
+                        # Don't transition immediately, let round finish? Or transition now?
+                        # Let's transition after the action completes.
+            elif action_type == "vote" and target:
+                 # Allow voting during discussion phase
+                 success = player.vote_for(target, self.state)
+            elif action_type == "question" and target and content:
+                 # Limit questions per player per day? Assume 1 for now.
+                 if player.questions_asked_today.get(target, 0) < 1 :
+                     success = player.question(target, content, self.state)
+                     if success:
+                         # Add questioned player to the question queue
+                         self._question_queue.append((player_name, target))
+                         self.state.log_hidden("system", f"{target} added to question queue by {player_name}")
+                         # Questioner gets another turn immediately after questioned?
+                         # Per description: "person who questioned is able to then respond"
+                         # Let's add questioner after questioned in queue
+                         self._question_queue.append((player_name, player_name)) # Special tuple marker?
+
+                 else:
+                      self.state.log_hidden(player_name, f"Attempted to question {target} again, limit reached.")
+            elif action_type == "predict" and target and content:
+                 success = player.predict_role(target, content, self.state)
+            elif action_type == "whisper" and target and content:
+                 success = player.whisper(target, content, self.state)
+                 # Need to ensure whisper content gets to target's next observation
+            else:
+                 # Default speak action / generic message
+                 if content:
+                     self.state.log_message(player_name, content)
+                     success = True
+                 else: # Invalid action format
+                      self.state.log_hidden(player_name, f"Submitted invalid action format: {action}")
+
+            # Mark turn as taken for this round-robin cycle
+            self._turns_taken_this_round.add(player_name)
+
+        # --- Voting Phase Actions ---
+        elif self.state.phase == GamePhase.VOTING:
+             if action_type == "vote" and target == self.state.player_on_trial:
+                  # Allow voting only for the player on trial
+                  success = player.vote_for(target, self.state)
+                  # Might need separate vote tally: self.state.votes_for_lynch[player_name] = True/False?
+                  # Or stick with player.vote attribute? Let's use dedicated dict for final lynch
+                  is_guilty_vote = action.get("vote_type") == VoteType.FINAL_GUILTY # Assuming action includes this
+                  self.state.votes_for_lynch[player_name] = is_guilty_vote
+                  success = True # Mark action processed
+             else:
+                  self.state.log_hidden(player_name, f"Invalid action {action} during Voting phase.")
+
+
+        # --- Defense Phase Action ---
+        elif self.state.phase == GamePhase.DEFENSE:
+             if player_name == self.state.player_on_trial and content:
+                 self.state.log_message(player_name, f"(Defense): {content}")
+                 success = True
+             else:
+                 self.state.log_hidden(player_name, f"Tried to speak during defense, but not on trial.")
+
+
+        # --- Final Vote Phase Action ---
+        elif self.state.phase == GamePhase.FINAL_VOTE:
+             if action_type == "vote":
+                 vote_type_str = action.get("vote_type", "").lower()
+                 if vote_type_str == "final_guilty":
+                     self.state.votes_for_lynch[player_name] = True
+                     self.state.log_message(player_name, f"votes GUILTY on {self.state.player_on_trial}.")
+                     success = True
+                 elif vote_type_str == "final_innocent":
+                     self.state.votes_for_lynch[player_name] = False
+                     self.state.log_message(player_name, f"votes INNOCENT on {self.state.player_on_trial}.")
+                     success = True
+                 else:
+                      self.state.log_hidden(player_name, f"Invalid vote type '{vote_type_str}' during final vote.")
+             else:
+                 self.state.log_hidden(player_name, f"Invalid action {action} during Final Vote phase.")
+
+
+        # --- Post-Action ---
         if success:
-            track_tokens(name, action, content)
+            # Advance turn only if action was successful and in discussion phase
+            if self.state.phase == GamePhase.DAY_DISCUSSION:
+                 # Check if accusation triggers immediate phase change
+                 if self.state.player_on_trial and action_type == "accuse":
+                     self._transition_to_voting() # Or defense if enabled
+                 else:
+                     self.advance_turn()
+        else:
+            self.state.log_hidden(player_name, f"Action {action} failed processing.")
+            # Do not advance turn if action failed? Or advance anyway? Let's advance.
+            if self.state.phase == GamePhase.DAY_DISCUSSION:
+                 self.advance_turn()
+
         return success
 
-    def apply_rewards(self):
-        compute_rewards(self.state)
 
+    # --- Private Phase Logic Methods ---
+
+    def _resolve_night(self):
+        """Resolves all submitted night actions according to standard order."""
+        self.state.log_message("system", "Night ends. Resolving actions...")
+        self.state.night_action_results.clear() # Clear previous results
+        submitted_actions = self.state.night_actions_submitted
+
+        # --- Action Resolution Order ---
+        # 1. Roleblocks / Disruptions (e.g., Blackmailer blocks speaking)
+        roleblocked_players: Set[str] = set()
+        blackmailed_players: Set[str] = set()
+        # TODO: Add Roleblocker role and logic
+        # for actor, action in submitted_actions.items():
+        #     if action.get("type") == "roleblock" and self.state.is_alive(actor):
+        #         target = action.get("target")
+        #         if self.state.is_alive(target):
+        #             roleblocked_players.add(target)
+        #             self.state.log_hidden(actor, f"Roleblocked {target}")
+        #     elif action.get("type") == "blackmail" # ... etc ...
+
+        # Apply roleblocks to players
+        for rb_target in roleblocked_players:
+             player = self.state.get_player(rb_target)
+             if player: player.is_roleblocked = True
+
+        # Apply other effects like blackmail
+        # for bm_target in blackmailed_players: ... player.can_speak_today = False ...
+
+
+        # 2. Protections (e.g., Doctor)
+        protected_players: Dict[str, str] = {} # target -> protector_name
+        for actor, action in submitted_actions.items():
+            if not self.state.is_alive(actor) or actor in roleblocked_players: continue # Dead or blocked
+            if action.get("type") == "protect":
+                target = action.get("target")
+                if self.state.is_alive(target):
+                    # Allow multiple protects? For now, last one counts or first? Let's say first.
+                    if target not in protected_players:
+                         protected_players[target] = actor
+                         # Store who protected them on the player object
+                         target_player = self.state.get_player(target)
+                         if target_player: target_player.protected_by = actor
+                         self.state.log_hidden(actor, f"Successfully protected {target}")
+
+        # 3. Kills (e.g., Mafia Godfather)
+        kill_attempts: List[Tuple[str, str]] = [] # (killer_name, target_name)
+        for actor, action in submitted_actions.items():
+             if not self.state.is_alive(actor) or actor in roleblocked_players: continue
+             if action.get("type") == "kill":
+                  target = action.get("target")
+                  if self.state.is_alive(target):
+                      kill_attempts.append((actor, target))
+                      self.state.log_hidden(actor, f"Attempting kill on {target}")
+
+        # Resolve kills vs protections
+        successful_kills: Set[str] = set()
+        for killer, target in kill_attempts:
+            if target not in protected_players:
+                 successful_kills.add(target)
+                 self.state.log_hidden(killer, f"Kill on {target} successful (not protected).")
+            else:
+                 protector = protected_players[target]
+                 self.state.log_hidden(killer, f"Kill on {target} failed (protected by {protector}).")
+                 self.state.log_hidden(protector, f"Your protection on {target} worked!")
+                 # Optionally notify killer / protector in results
+
+        # Apply kills
+        deaths_this_night = []
+        for target_to_die in successful_kills:
+             if self.state.is_alive(target_to_die): # Check again in case multiple kills target same person
+                  self.state.kill_player(target_to_die, reason="killed during night")
+                  deaths_this_night.append(target_to_die)
+
+
+        # 4. Investigations (e.g., Cop, Consigliere)
+        # Note: Results were already stored in player memory during perform_night_action
+        # This step is mainly for logging or cross-referencing if needed.
+        for actor, action in submitted_actions.items():
+             if not self.state.is_alive(actor) or actor in roleblocked_players: continue
+             if action.get("type") == "investigate":
+                  target = action.get("target")
+                  result = action.get("result") # Get result stored earlier
+                  self.state.log_hidden(actor, f"Investigation result for {target}: {result}")
+                  # Store in night_action_results for environment access if needed
+                  self.state.night_action_results[actor] = action
+
+
+        # 5. Other Night Actions (e.g., Consigliere role check, Blackmailer)
+
+
+        # Announce deaths
+        if deaths_this_night:
+             # Sort for consistent output
+             announce_deaths = ", ".join(sorted(deaths_this_night))
+             self.state.log_message("system", f"The sun rises. The following people were found dead: {announce_deaths}.")
+        else:
+             self.state.log_message("system", "The sun rises. Miraculously, everyone survived the night!")
+
+
+    def _transition_to_day(self):
+        """Resets night states and prepares for the day phase."""
+        self.state.log_hidden("system", "Transitioning to Day phase.")
+        # Reset player night states AFTER resolution but before day starts
+        for player in self.state.players:
+            player.reset_night_state() # Clears roleblock status etc. for next night
+
+        self.state.phase = GamePhase.DAY_DISCUSSION
+        self.state.day_count += 1
+        self.state.reset_day_phase_state() # Clear votes, trial status, etc.
+        self._start_new_discussion_round() # Setup speaker queue
+        self.state.log_message("system", f"Day {self.state.day_count} begins. Discuss and vote!")
+
+
+    def _start_new_discussion_round(self):
+        """Sets up the speaker queue for a round of discussion."""
+        self.state.log_hidden("system", "Starting new discussion round.")
+        self._speaker_queue.clear()
+        self._turns_taken_this_round.clear()
+        self._question_queue.clear() # Clear pending questions? Or let them persist? Let's clear.
+        self.state.turn_context = None
+        self._consecutive_passes = 0
+
+        # Get list of alive players, potentially ordered
+        alive_player_names = sorted(list(self.state.alive_players)) # Sort for consistency
+
+        # Optional: Cop speaks first
+        if self.cop_speaks_first:
+             cop_player = None
+             for name in alive_player_names:
+                 player = self.state.get_player(name)
+                 if player and isinstance(player.role, Cop):
+                     cop_player = name
+                     break
+             if cop_player:
+                 alive_player_names.remove(cop_player)
+                 alive_player_names.insert(0, cop_player)
+                 self.state.log_hidden("system", f"Cop ({cop_player}) will speak first.")
+
+        self._speaker_queue.extend(alive_player_names)
+        self.state.turn_number_in_phase = 0 # Reset turn count for new round
+        self.advance_turn() # Set the first speaker
+
+    def _check_discussion_end(self) -> bool:
+        """Checks if the discussion phase should end."""
+        # Condition 1: Everyone alive has passed consecutively
+        if self._consecutive_passes >= len(self.state.alive_players):
+            self.state.log_hidden("system", "Discussion ending: Everyone passed.")
+            return True
+
+        # Condition 2: Everyone alive has had a turn this round and queue is empty
+        # (Avoids infinite loop if someone leaves mid-round? Check count vs set size)
+        if not self._speaker_queue and not self._question_queue and len(self._turns_taken_this_round) >= len(self.state.alive_players):
+             self.state.log_hidden("system", "Discussion ending: Round complete, queues empty.")
+             return True
+
+        # Condition 3: Accusation successful (handled in process_player_action)
+        if self.state.player_on_trial:
+             # This state means discussion ended due to accusation
+             self.state.log_hidden("system", f"Discussion ended: {self.state.player_on_trial} was accused.")
+             return True
+
+        # Condition 4: Timer / Max Turns / Token Budget (TODO)
+        # if self.state.turn_number_in_phase >= self.config.get("max_day_turns", 20): ...
+
+        return False
+
+
+    def _transition_to_voting(self):
+         """Moves from discussion to voting on the accused player."""
+         if not self.state.player_on_trial:
+             # If discussion ended without accusation (everyone passed), skip to night
+             self.state.log_message("system", "No one was put on trial today.")
+             self._transition_to_night()
+             return
+
+         self.state.log_message("system", f"{self.state.player_on_trial} is on trial!")
+         self.state.votes_for_lynch.clear() # Clear final lynch votes
+
+         if self.lynch_defense_enabled:
+             self.state.phase = GamePhase.DEFENSE
+             self.state.current_player_turn = self.state.player_on_trial # Accused speaks
+             self.state.log_message("system", f"{self.state.player_on_trial}, you may make your defense.")
+         else:
+             # Skip defense, go directly to final vote
+             self._transition_to_final_vote()
+
+
+    def _run_defense(self):
+        """Placeholder for logic during the defense phase (mostly waiting for the accused agent)."""
+        # The simulation loop needs to call process_player_action for the accused player.
+        # Once they submit their defense (or pass), we transition.
+        # For now, assume defense happens instantly or is handled by simulation loop tick.
+        self.state.log_hidden("system", f"Defense phase for {self.state.player_on_trial}.")
+        # After defense speech (or pass):
+        # _transition_to_final_vote() will be called
+
+
+    def _transition_to_final_vote(self):
+        """Moves to the final guilty/innocent voting phase."""
+        self.state.phase = GamePhase.FINAL_VOTE
+        self.state.current_player_turn = None # Or iterate through voters? Assume simultaneous for now
+        self.state.votes_for_lynch.clear() # Ensure votes are fresh for final decision
+        self.state.log_message("system", f"Final voting begins for {self.state.player_on_trial}. Vote Guilty or Innocent.")
+        # The simulation loop needs to collect votes from all alive players in this phase.
+
+
+    def _resolve_lynch(self):
+        """Tally final votes and execute the lynch if majority guilty."""
+        if not self.state.player_on_trial:
+            self.state.log_hidden("system", "Lynch resolution skipped: No player on trial.")
+            return
+
+        votes = self.state.votes_for_lynch
+        guilty_votes = sum(1 for is_guilty in votes.values() if is_guilty)
+        innocent_votes = len(votes) - guilty_votes # Assumes everyone voted
+        total_alive = len(self.state.alive_players)
+        needed_for_guilty = total_alive // 2 + 1
+
+        self.state.log_message("system", f"Vote Results for {self.state.player_on_trial}: Guilty={guilty_votes}, Innocent={innocent_votes} (Need {needed_for_guilty} for guilty)")
+        self.state.log_hidden("system", f"Final votes: {votes}")
+
+        if guilty_votes >= needed_for_guilty:
+            target = self.state.player_on_trial
+            self.state.log_message("system", f"The town has decided to lynch {target}!")
+            self.state.kill_player(target, reason="lynched")
+        else:
+            self.state.log_message("system", f"The town has decided to spare {self.state.player_on_trial}.")
+
+        # Reset trial state after resolution
+        self.state.player_on_trial = None
+
+
+    def _transition_to_night(self):
+        """Resets day states and prepares for the night phase."""
+        self.state.log_hidden("system", "Transitioning to Night phase.")
+
+        # Resolve lynch if it hasn't happened yet (e.g., if skipping phases)
+        if self.state.player_on_trial and self.state.phase != GamePhase.NIGHT:
+             self._resolve_lynch()
+
+        # Check game end again after potential lynch
+        if self.state.check_game_end():
+            return
+
+        # Reset states for the upcoming night
+        self.state.phase = GamePhase.NIGHT
+        self.state.reset_night_phase_state() # Clear submitted actions etc.
+        # No specific player turn at night start; agents submit actions simultaneously (conceptually)
+        self.state.current_player_turn = None
+        self.state.log_message("system", "Night falls. Choose your actions carefully...")
+
+    # --- Utility ---
+    # Removed old _process_votes, _process_lynch, act, _get_observations as logic is integrated
+    # Removed old step method
+
+    def apply_rewards(self):
+        """Computes and potentially stores rewards based on the current state."""
+        # Placeholder: Actual reward calculation might happen at specific events or end of game
+        rewards = compute_rewards(self.state)
+        self.state.log_hidden("system", f"Computed rewards (not stored): {rewards}")
+        # Store rewards in state or return them if needed by simulation runner
 
 # === export.py ===
 # export.py
@@ -1101,150 +1539,6 @@ class MessagingSystem:
             "private": msg.private,
             "content": msg.content
         } for msg in self.history]
-
-
-# === mechanics\night.py ===
-# mafia/mechanics/night.py
-
-from mafia.enums import RoleType
-from mafia.game_state import GameState
-
-def resolve_night_phase(game_state: GameState):
-    """
-    Resolves all night actions in the game. This includes mafia kills,
-    investigations, roleblocks, protections, etc. Follows a standard resolution order.
-    """
-    # Stage 1: Apply roleblocks
-    roleblocked = set()
-    for actor, action in game_state.night_actions.items():
-        if action.get("type") == "roleblock":
-            target = action.get("target")
-            roleblocked.add(target)
-
-    # Stage 2: Apply protection
-    protected = set()
-    for actor, action in game_state.night_actions.items():
-        if action.get("type") == "protect":
-            target = action.get("target")
-            if target not in roleblocked:
-                protected.add(target)
-
-    # Stage 3: Apply mafia kills (Godfather priority)
-    kill_targets = []
-    for actor, action in game_state.night_actions.items():
-        if action.get("type") == "kill":
-            if actor in roleblocked:
-                continue
-            target = action.get("target")
-            if target not in protected:
-                kill_targets.append(target)
-
-    for target in kill_targets:
-        if game_state.is_alive(target):
-            game_state.kill_player(target)
-            game_state.messages.append(f"{target} was killed during the night.")
-
-    # Stage 4: Investigations (e.g., Cop)
-    for actor, action in game_state.night_actions.items():
-        if action.get("type") == "investigate" and actor not in roleblocked:
-            target = action.get("target")
-            player_obj = game_state.get_player(target)
-            result = {
-                "target": target,
-                "alignment": player_obj.role.alignment if player_obj else "unknown"
-            }
-            investigator = game_state.get_player(actor)
-            if investigator:
-                investigator.memory.append(result)
-
-    # Stage 5: Cleanup
-    game_state.night_actions.clear()
-
-
-# === mechanics\phases.py ===
-# mafia/mechanics/phases.py
-
-from mafia.enums import Phase
-from mafia.game_state import GameState
-from mafia.player import Player
-from mafia.mechanics.roles import Role
-
-
-def transition_to_day(game_state: GameState):
-    """
-    Executes night actions and moves the game to the day phase.
-    This includes resolving kills, roleblocks, protections, and logging.
-    """
-    # Resolve night actions
-    kills = []
-    protections = set()
-
-    for actor_name, action in game_state.night_actions.items():
-        player = game_state.get_player(actor_name)
-        if not player or not player.can_act():
-            continue
-
-        if 'kill' in action:
-            target = action['kill']
-            if target:
-                kills.append(target.name)
-                game_state.log_hidden(actor_name, f"Attempted kill on {target.name}")
-
-        if 'investigation' in action:
-            result = action['investigation']
-            game_state.log_hidden(actor_name, f"Investigated: {result}")
-
-        if 'protect' in action:
-            target = action['protect']
-            if target:
-                protections.add(target.name)
-                game_state.log_hidden(actor_name, f"Protected {target.name}")
-
-        if 'roleblock' in action:
-            target = action['roleblock']
-            if target:
-                target.is_roleblocked = True
-                game_state.log_hidden(actor_name, f"Roleblocked {target.name}")
-
-    # Resolve kills unless protected
-    for target_name in kills:
-        if target_name not in protections and game_state.is_alive(target_name):
-            game_state.kill_player(target_name)
-            game_state.messages.append(f"{target_name} was found dead in the morning.")
-            game_state.log_hidden("system", f"{target_name} died during the night")
-
-    # Reset states
-    for player in game_state.players:
-        player.reset_night_state()
-        player.reset_day_state()
-
-    game_state.reset_votes()
-    game_state.reset_discussion_state()
-    game_state.night_actions.clear()
-    game_state.day_count += 1
-    game_state.phase = Phase.DAY
-
-
-def transition_to_night(game_state: GameState):
-    """
-    Ends the day phase, processes votes, and transitions to night.
-    Includes resolving lynch and updating alive/dead lists.
-    """
-    # Process lynch
-    if game_state.accused_player:
-        votes_for_lynch = sum(game_state.lynch_confirm_votes.values())
-        total_alive = len(game_state.alive_players)
-
-        if votes_for_lynch > total_alive // 2:
-            game_state.kill_player(game_state.accused_player)
-            game_state.messages.append(f"{game_state.accused_player} was lynched.")
-            game_state.log_hidden("system", f"{game_state.accused_player} was lynched by majority")
-        else:
-            game_state.messages.append(f"Nobody was lynched today.")
-
-    game_state.phase = Phase.NIGHT
-    game_state.reset_votes()
-    game_state.reset_discussion_state()
 
 
 # === mechanics\roles.py ===
