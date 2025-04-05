@@ -5,15 +5,15 @@ from collections import deque
 from typing import Dict, List, Optional, Any, Tuple, Set
 
 # Core project imports (ensure they match your directory structure)
-from mafia.game_state import GameState
-from mafia.player import Player
-from mafia.enums import GamePhase, Faction, VoteType
-from mafia.mechanics.roles import Cop, Godfather, Roleblocker,Doctor
+from llm_games.mafia.game_state import GameState, GameMessage
+from llm_games.mafia.player import Player
+from llm_games.mafia.enums import GamePhase, Faction, VoteType
+from llm_games.mafia.mechanics.roles import Cop, Godfather, RoleBlocker,Doctor
 # If you have a RoleBlocker or Blackmailer, import them similarly:
-# from mafia.mechanics.roles import RoleBlocker, Blackmailer
+# from llm_games.mafia.mechanics.roles import RoleBlocker, Blackmailer
 
-# from mafia.rewards import compute_rewards  # If/when using a reward system
-# from mafia.utils.token_cost import track_tokens  # If/when tracking token budgets
+# from llm_games.mafia.rewards import compute_rewards  # If/when using a reward system
+# from llm_games.mafia.utils.token_cost import track_tokens  # If/when tracking token budgets
 
 # Dummy placeholders if those modules are not yet implemented:
 def compute_rewards(state) -> Dict[str, float]:
@@ -176,6 +176,7 @@ class MafiaEnvironment:
             if success and not self.state.player_on_trial:
                 # If an accusation occurs, we transition to voting within the same turn, so skip advance_turn
                 self.advance_turn()
+            
 
         # ----------------------------------------------------------------
         # VOTING PHASE
@@ -407,30 +408,32 @@ class MafiaEnvironment:
         self.advance_turn()
 
     def _check_discussion_end(self) -> bool:
-        """
-        Checks if we must end DAY_DISCUSSION:
-          - Everyone passes in a row
-          - An accusation is made
-          - The day discussion round is otherwise complete (all spoke, queue empty)
-          - (Optional) A max turn or time-based limit
-        """
-        # 1. Everyone passes consecutively
-        if self._consecutive_passes >= len(self.state.alive_players):
-            self.state.log_hidden("system", "All players have consecutively passed. Discussion ending.")
+        alive_count = len(self.state.alive_players)
+        # Set minimum turns: 1 turn each for Day 0, 2 for later days.
+        min_turns = self.config.get("min_discussion_turns", 2)
+        if self.state.day_count == 0:
+            min_turns = 1
+
+        # Count turns from the hidden log for each player during DAY_DISCUSSION.
+        player_turn_counts = {p: 0 for p in self.state.alive_players}
+        for entry in self.state.hidden_log:
+            if entry.get("phase") == GamePhase.DAY_DISCUSSION.name and entry.get("actor") in player_turn_counts:
+                player_turn_counts[entry["actor"]] += 1
+
+        self.state.log_hidden("system", f"Discussion turn counts: {player_turn_counts}")
+
+        # End discussion if all players have met the minimum turns.
+        if all(count >= min_turns for count in player_turn_counts.values()):
+            self.state.log_hidden("system", f"All players completed {min_turns} discussion turns. Ending discussion.")
             return True
 
-        # 2. If the queue is empty and every living player has spoken at least once
-        if (not self._speaker_queue and not self._question_queue 
-                and len(self._turns_taken_this_round) >= len(self.state.alive_players)):
-            self.state.log_hidden("system", "Discussion round ended: queue empty, everyone spoke.")
-            return True
-
-        # 3. If someone is on trial already (accusation triggered)
-        if self.state.player_on_trial:
-            self.state.log_hidden("system", f"Discussion ended: {self.state.player_on_trial} was put on trial.")
+        # Alternatively, if everyone passes consecutively.
+        if self._consecutive_passes >= alive_count:
+            self.state.log_hidden("system", "All players passed consecutively. Ending discussion.")
             return True
 
         return False
+
 
     def _transition_to_voting(self):
         """
@@ -554,6 +557,15 @@ class MafiaEnvironment:
             # Mark that the player has taken a turn
             self._turns_taken_this_round.add(player.name)
             return True
+        elif action_type == "accuse" and target:
+            if self.state.day_count == 0:
+                self.state.log_hidden(player.name, "Accusations are not allowed on Day 0.")
+                return False
+            success = player.accuse(target, self.state)
+            if success:
+                self.state.player_on_trial = target
+            self._turns_taken_this_round.add(player.name)
+            return success
         else:
             # They did something, so reset the pass counter
             self._consecutive_passes = 0

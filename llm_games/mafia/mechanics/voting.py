@@ -1,7 +1,7 @@
 # mafia/mechanics/voting.py
 from typing import Dict, Optional
-from mafia.enums import Phase
-from mafia.game_state import GameState
+from llm_games.mafia.enums import Phase
+from llm_games.mafia.game_state import GameState
 
 
 def cast_vote(game_state: GameState, voter: str, target: str) -> None:

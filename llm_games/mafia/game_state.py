@@ -5,9 +5,9 @@ from typing import List, Dict, Optional, Set, Any, Union
 import uuid
 
 # Core references to your enums, players, and roles:
-from mafia.enums import GamePhase, Faction
-from mafia.player import Player
-from mafia.mechanics.roles import Goon, Godfather, get_role_class
+from llm_games.mafia.enums import GamePhase, Faction
+from llm_games.mafia.player import Player
+from llm_games.mafia.mechanics.roles import Goon, Godfather, get_role_class
 
 # -------------------------------------------------------------------
 # Define the "type" of a single logged message, for clarity.
@@ -394,6 +394,10 @@ class GameState:
         # Gather messages visible to this player
         visible_messages: List[str] = []
         for msg_obj in self.messages:
+            if not isinstance(msg_obj, GameMessage):
+                # Optionally print or log what went wrong
+                self.log_hidden(player_name, f"Invalid message object (type={type(msg_obj)}): {msg_obj}")
+                continue  # Skip any malformed message
             is_recip_private = (msg_obj.recipients is not None and player_name in msg_obj.recipients)
             is_sender_private = (msg_obj.sender == player_name and msg_obj.recipients is not None)
             if (msg_obj.recipients is None) or is_recip_private or is_sender_private:

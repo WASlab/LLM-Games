@@ -1,0 +1,31 @@
+[project]
+name = "llm-games"
+version = "0.1.0"
+description = "LLM agents in structured social game environments like Mafia and Town of Salem."
+authors = [{ name = "Waslab", email = "gradiorum@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "tqdm",
+    "openai",
+    "pydantic>=2.0",
+    "typing-extensions",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+    
+]
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["llm_games", "llm_games.mafia", "llm_games.town_of_salem"]
+
+[tool.setuptools.package-dir]
+"" = "."

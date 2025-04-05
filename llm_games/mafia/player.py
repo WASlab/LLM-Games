@@ -1,11 +1,12 @@
 from typing import Optional, Dict, List, Any
 # Import the base Role class and Faction enum
-from mafia.mechanics.roles import Role
-from mafia.enums import Faction
+from llm_games.mafia.mechanics.roles import Role
+from llm_games.mafia.enums import Faction
+from llm_games.mafia.mechanics.messaging import GameMessage
 # Import GameState for type hinting only to avoid circular dependency
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from mafia.game_state import GameState
+    from llm_games.mafia.game_state import GameState
 
 
 class Player:
@@ -93,22 +94,32 @@ class Player:
     # --- Day Actions ---
 
     def accuse(self, target: str, game_state: 'GameState') -> bool:
-        """
-        Attempts to accuse a target. Only allowed once per day.
-        Logs the accusation and appends a public message.
-        """
-        if not self.can_speak() or self.has_accused_today:
-            self.log_hidden(game_state, f"Attempted to accuse {target} but couldn't (already accused or cannot speak).")
+        if not self.can_speak():
+            self.log_hidden(game_state, f"Attempted to accuse {target} but cannot speak.")
             return False
         target_player = game_state.get_player(target)
         if not target_player or not target_player.alive:
             self.log_hidden(game_state, f"Attempted to accuse {target} but they are dead or invalid.")
             return False
 
-        self.log_hidden(game_state, f"Accused {target}")
-        game_state.messages.append(f"{self.name} accuses {target}!")
-        self.has_accused_today = True
+        # Allow re‑accusation: simply log the new accusation
+        if self.has_accused_today:
+            self.log_hidden(game_state, f"Re‑accusing: updating previous accusation to {target}.")
+            # Optionally, update vote counts here if needed (via game_state.update_vote_counts)
+        else:
+            self.has_accused_today = True
+
+        # Instead of appending a raw string, create a GameMessage.
+        game_state.messages.append(GameMessage(
+            msg_type="public",
+            sender=self.name,
+            content=f"{self.name} accuses {target}!",
+            recipients=None,
+            phase=game_state.phase,
+            day=game_state.day_count
+        ))
         return True
+
 
     def predict_role(self, target: str, predicted_role_name: str, game_state: 'GameState') -> bool:
         """

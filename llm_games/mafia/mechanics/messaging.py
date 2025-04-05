@@ -1,7 +1,29 @@
 # mafia/mechanics/messaging.py
-from typing import Dict, List, Optional, Tuple
-from mafia.enums import Phase
+from typing import Dict, List, Optional, Tuple, Any
 
+from dataclasses import dataclass, field
+from llm_games.mafia.enums import GamePhase
+
+@dataclass
+class GameMessage:
+    """Structured record of a single game message."""
+    msg_type: str       # e.g. 'system', 'public', 'whisper', ...
+    sender: str         # 'system' or player_name
+    content: str
+    recipients: Optional[List[str]] = None  # None means public
+    phase: GamePhase = GamePhase.NIGHT
+    day: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a serializable dict (helpful if you store logs as JSON)."""
+        return {
+            "type": self.msg_type,
+            "sender": self.sender,
+            "content": self.content,
+            "recipients": self.recipients,
+            "phase": self.phase.name,
+            "day": self.day
+        }
 class Message:
     def __init__(self, sender: str, content: str, target: Optional[str] = None, private: bool = False):
         self.sender = sender              # Who sent the message
@@ -31,7 +53,7 @@ class MessagingSystem:
         self.history.append(msg)
         return msg
 
-    def get_visible_messages(self, player_name: str, phase: Phase) -> List[str]:
+    def get_visible_messages(self, player_name: str, phase: GamePhase) -> List[str]:
         visible = []
         for msg in self.history:
             if not msg.private:

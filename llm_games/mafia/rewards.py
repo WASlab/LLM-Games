@@ -1,6 +1,6 @@
 # mafia/rewards.py
 from typing import Dict
-from mafia.enums import Faction
+from llm_games.mafia.enums import Faction
 
 
 def assign_endgame_rewards(game_state) -> Dict[str, float]:

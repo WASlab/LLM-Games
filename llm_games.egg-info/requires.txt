@@ -1,0 +1,9 @@
+tqdm
+openai
+pydantic>=2.0
+typing-extensions
+
+[dev]
+pytest
+black
+ruff

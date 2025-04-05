@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: llm-games
+Version: 0.1.0
+Summary: LLM agents in structured social game environments like Mafia and Town of Salem.
+Author-email: Waslab <gradiorum@gmail.com>
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: tqdm
+Requires-Dist: openai
+Requires-Dist: pydantic>=2.0
+Requires-Dist: typing-extensions
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Dynamic: license-file
+
+# LLM-Games
+ Game Environments for LLM Agents
