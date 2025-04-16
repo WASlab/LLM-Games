@@ -21,7 +21,7 @@ def export_to_json(output_path="code_snapshot.json", root="mafia"):
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(all_files, f, indent=2)
 
-def export_to_text(output_path="code_snapshot.txt", root="mafia"):
+def export_to_text(output_path="code_snapshot.txt", root="llm_games"):
     all_files = collect_python_files(root)
     with open(output_path, 'w', encoding='utf-8') as f:
         for path, content in all_files.items():

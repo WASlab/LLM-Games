@@ -1,7 +1,7 @@
-# === config.py ===
+# === mafia\config.py ===
 
 
-# === enums.py ===
+# === mafia\enums.py ===
 from enum import Enum
 
 class Faction(Enum):
@@ -23,7 +23,7 @@ class VoteType(Enum):
     FINAL_INNOCENT = "final_innocent" # Vote during final lynch
     SKIP = "skip" # Abstain from voting
 
-# === environment.py ===
+# === mafia\environment.py ===
 # === mafia/environment.py ===
 
 import random
@@ -31,15 +31,15 @@ from collections import deque
 from typing import Dict, List, Optional, Any, Tuple, Set
 
 # Core project imports (ensure they match your directory structure)
-from mafia.game_state import GameState
-from mafia.player import Player
-from mafia.enums import GamePhase, Faction, VoteType
-from mafia.mechanics.roles import Cop, Godfather, Roleblocker,Doctor
+from llm_games.mafia.game_state import GameState, GameMessage
+from llm_games.mafia.player import Player
+from llm_games.mafia.enums import GamePhase, Faction, VoteType
+from llm_games.mafia.mechanics.roles import Cop, Godfather, RoleBlocker,Doctor
 # If you have a RoleBlocker or Blackmailer, import them similarly:
-# from mafia.mechanics.roles import RoleBlocker, Blackmailer
+# from llm_games.mafia.mechanics.roles import RoleBlocker, Blackmailer
 
-# from mafia.rewards import compute_rewards  # If/when using a reward system
-# from mafia.utils.token_cost import track_tokens  # If/when tracking token budgets
+# from llm_games.mafia.rewards import compute_rewards  # If/when using a reward system
+# from llm_games.mafia.utils.token_cost import track_tokens  # If/when tracking token budgets
 
 # Dummy placeholders if those modules are not yet implemented:
 def compute_rewards(state) -> Dict[str, float]:
@@ -202,6 +202,7 @@ class MafiaEnvironment:
             if success and not self.state.player_on_trial:
                 # If an accusation occurs, we transition to voting within the same turn, so skip advance_turn
                 self.advance_turn()
+            
 
         # ----------------------------------------------------------------
         # VOTING PHASE
@@ -433,30 +434,32 @@ class MafiaEnvironment:
         self.advance_turn()
 
     def _check_discussion_end(self) -> bool:
-        """
-        Checks if we must end DAY_DISCUSSION:
-          - Everyone passes in a row
-          - An accusation is made
-          - The day discussion round is otherwise complete (all spoke, queue empty)
-          - (Optional) A max turn or time-based limit
-        """
-        # 1. Everyone passes consecutively
-        if self._consecutive_passes >= len(self.state.alive_players):
-            self.state.log_hidden("system", "All players have consecutively passed. Discussion ending.")
+        alive_count = len(self.state.alive_players)
+        # Set minimum turns: 1 turn each for Day 0, 2 for later days.
+        min_turns = self.config.get("min_discussion_turns", 2)
+        if self.state.day_count == 0:
+            min_turns = 1
+
+        # Count turns from the hidden log for each player during DAY_DISCUSSION.
+        player_turn_counts = {p: 0 for p in self.state.alive_players}
+        for entry in self.state.hidden_log:
+            if entry.get("phase") == GamePhase.DAY_DISCUSSION.name and entry.get("actor") in player_turn_counts:
+                player_turn_counts[entry["actor"]] += 1
+
+        self.state.log_hidden("system", f"Discussion turn counts: {player_turn_counts}")
+
+        # End discussion if all players have met the minimum turns.
+        if all(count >= min_turns for count in player_turn_counts.values()):
+            self.state.log_hidden("system", f"All players completed {min_turns} discussion turns. Ending discussion.")
             return True
 
-        # 2. If the queue is empty and every living player has spoken at least once
-        if (not self._speaker_queue and not self._question_queue 
-                and len(self._turns_taken_this_round) >= len(self.state.alive_players)):
-            self.state.log_hidden("system", "Discussion round ended: queue empty, everyone spoke.")
-            return True
-
-        # 3. If someone is on trial already (accusation triggered)
-        if self.state.player_on_trial:
-            self.state.log_hidden("system", f"Discussion ended: {self.state.player_on_trial} was put on trial.")
+        # Alternatively, if everyone passes consecutively.
+        if self._consecutive_passes >= alive_count:
+            self.state.log_hidden("system", "All players passed consecutively. Ending discussion.")
             return True
 
         return False
+
 
     def _transition_to_voting(self):
         """
@@ -580,6 +583,15 @@ class MafiaEnvironment:
             # Mark that the player has taken a turn
             self._turns_taken_this_round.add(player.name)
             return True
+        elif action_type == "accuse" and target:
+            if self.state.day_count == 0:
+                self.state.log_hidden(player.name, "Accusations are not allowed on Day 0.")
+                return False
+            success = player.accuse(target, self.state)
+            if success:
+                self.state.player_on_trial = target
+            self._turns_taken_this_round.add(player.name)
+            return success
         else:
             # They did something, so reset the pass counter
             self._consecutive_passes = 0
@@ -761,7 +773,7 @@ class MafiaEnvironment:
         return action_dict
 
 
-# === export.py ===
+# === mafia\export.py ===
 # export.py
 import os
 import json
@@ -785,7 +797,7 @@ def export_to_json(output_path="code_snapshot.json", root="mafia"):
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(all_files, f, indent=2)
 
-def export_to_text(output_path="code_snapshot.txt", root="mafia"):
+def export_to_text(output_path="code_snapshot.txt", root="llm_games"):
     all_files = collect_python_files(root)
     with open(output_path, 'w', encoding='utf-8') as f:
         for path, content in all_files.items():
@@ -798,7 +810,7 @@ if __name__ == "__main__":
     print("✅ Codebase exported to 'code_snapshot.json' and 'code_snapshot.txt'")
 
 
-# === game_state.py ===
+# === mafia\game_state.py ===
 # === mafia/game_state.py ===
 
 from dataclasses import dataclass, field
@@ -806,9 +818,9 @@ from typing import List, Dict, Optional, Set, Any, Union
 import uuid
 
 # Core references to your enums, players, and roles:
-from mafia.enums import GamePhase, Faction
-from mafia.player import Player
-from mafia.mechanics.roles import Goon, Godfather, get_role_class
+from llm_games.mafia.enums import GamePhase, Faction
+from llm_games.mafia.player import Player
+from llm_games.mafia.mechanics.roles import Goon, Godfather, get_role_class
 
 # -------------------------------------------------------------------
 # Define the "type" of a single logged message, for clarity.
@@ -1176,15 +1188,8 @@ class GameState:
     # ----------------------------------------------------------------
 
     def get_player_observation(self, player_name: str) -> Dict[str, Any]:
-        """
-        Generates a viewpoint for one player, containing:
-          - visible (public + relevant private) messages
-          - personal flags (roleblocked, protected, memory)
-          - day/phase details
-        """
         player = self.get_player(player_name)
         if not player or not player.alive:
-            # Alternatively, return a 'You are dead' prompt
             return {
                 "game_id": self.game_id,
                 "player_name": player_name,
@@ -1192,32 +1197,27 @@ class GameState:
                 "message": "You are no longer in the game."
             }
 
-        # Gather messages visible to this player
-        visible_messages: List[str] = []
-        for msg_obj in self.messages:
-            is_recip_private = (msg_obj.recipients is not None and player_name in msg_obj.recipients)
-            is_sender_private = (msg_obj.sender == player_name and msg_obj.recipients is not None)
-            if (msg_obj.recipients is None) or is_recip_private or is_sender_private:
-                # Format differently if it's a whisper or if they are the sender
-                if msg_obj.msg_type == "whisper":
+        visible_messages = []
+        for msg in self.messages:
+            is_recip_private = (msg.recipients is not None and player_name in msg.recipients)
+            is_sender_private = (msg.sender == player_name and msg.recipients is not None)
+            if (msg.recipients is None) or is_recip_private or is_sender_private:
+                if msg.msg_type == "whisper":
                     if is_sender_private:
-                        # From self to someone else
-                        visible_messages.append(
-                            f"(Whisper to {msg_obj.recipients[0]}) {msg_obj.content}"
-                        )
+                        visible_messages.append(f"(Whisper to {msg.recipients[0]}) {msg.content}")
                     elif is_recip_private:
-                        # A whisper from someone else to you
-                        visible_messages.append(
-                            f"(Whisper from {msg_obj.sender}) {msg_obj.content}"
-                        )
+                        visible_messages.append(f"(Whisper from {msg.sender}) {msg.content}")
                     else:
-                        # Shouldn't happen with typed logs, but just in case
-                        visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
+                        visible_messages.append(f"{msg.sender}: {msg.content}")
                 else:
-                    # Normal or system message
-                    visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
+                    visible_messages.append(f"{msg.sender}: {msg.content}")
 
-        # Construct final observation
+        # For mafia players, include the list of alive mafia members
+        if player.faction == Faction.MAFIA:
+            mafia_members = [p.name for p in self.players if p.alive and p.faction == Faction.MAFIA]
+        else:
+            mafia_members = []
+
         obs = {
             "game_id": self.game_id,
             "player_name": player.name,
@@ -1228,9 +1228,9 @@ class GameState:
             "day": self.day_count,
             "turn": self.turn_number_in_phase,
             "is_current_turn": (self.current_player_turn == player.name),
-            "alive_players": sorted(self.alive_players),
-            "dead_players": sorted(self.dead_players),
-            "messages": visible_messages[-20:],  # Limit message history
+            "alive_players": sorted(list(self.alive_players)),
+            "dead_players": sorted(list(self.dead_players)),
+            "messages": visible_messages[-20:],
             "can_speak": player.can_speak(),
             "can_act_tonight": (player.can_act_at_night() and self.phase == GamePhase.NIGHT),
             "player_on_trial": self.player_on_trial,
@@ -1239,12 +1239,11 @@ class GameState:
             "memory": list(player.memory),
             "is_roleblocked": player.is_roleblocked,
             "protected_by": player.protected_by,
-            # Example: "token_budget": self.discussion_token_budgets.get(player.name, 0),
-            "lynch_votes": {
-                voter: val for voter, val in self.votes_for_lynch.items()
-            },  # Show final vote states
+            "lynch_votes": {voter: val for voter, val in self.votes_for_lynch.items()},
+            "mafia_members": mafia_members
         }
         return obs
+
 
     # ----------------------------------------------------------------
     # Optional: Phase Tracking for Debug or Time-Aware Agents
@@ -1295,15 +1294,16 @@ class GameState:
 
 
 
-# === player.py ===
+# === mafia\player.py ===
 from typing import Optional, Dict, List, Any
 # Import the base Role class and Faction enum
-from mafia.mechanics.roles import Role
-from mafia.enums import Faction
+from llm_games.mafia.mechanics.roles import Role
+from llm_games.mafia.enums import Faction
+from llm_games.mafia.mechanics.messaging import GameMessage
 # Import GameState for type hinting only to avoid circular dependency
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from mafia.game_state import GameState
+    from llm_games.mafia.game_state import GameState
 
 
 class Player:
@@ -1391,22 +1391,32 @@ class Player:
     # --- Day Actions ---
 
     def accuse(self, target: str, game_state: 'GameState') -> bool:
-        """
-        Attempts to accuse a target. Only allowed once per day.
-        Logs the accusation and appends a public message.
-        """
-        if not self.can_speak() or self.has_accused_today:
-            self.log_hidden(game_state, f"Attempted to accuse {target} but couldn't (already accused or cannot speak).")
+        if not self.can_speak():
+            self.log_hidden(game_state, f"Attempted to accuse {target} but cannot speak.")
             return False
         target_player = game_state.get_player(target)
         if not target_player or not target_player.alive:
             self.log_hidden(game_state, f"Attempted to accuse {target} but they are dead or invalid.")
             return False
 
-        self.log_hidden(game_state, f"Accused {target}")
-        game_state.messages.append(f"{self.name} accuses {target}!")
-        self.has_accused_today = True
+        # Allow re‑accusation: simply log the new accusation
+        if self.has_accused_today:
+            self.log_hidden(game_state, f"Re‑accusing: updating previous accusation to {target}.")
+            # Optionally, update vote counts here if needed (via game_state.update_vote_counts)
+        else:
+            self.has_accused_today = True
+
+        # Instead of appending a raw string, create a GameMessage.
+        game_state.messages.append(GameMessage(
+            msg_type="public",
+            sender=self.name,
+            content=f"{self.name} accuses {target}!",
+            recipients=None,
+            phase=game_state.phase,
+            day=game_state.day_count
+        ))
         return True
+
 
     def predict_role(self, target: str, predicted_role_name: str, game_state: 'GameState') -> bool:
         """
@@ -1584,10 +1594,72 @@ class Player:
         return f"<Player: {self.name} | Role: {self.role.name} | Faction: {self.faction.value} | Status: {status}>"
 
 
-# === rewards.py ===
+# === mafia\play_test.py ===
+# play_test.py
+
+from llm_games.mafia.simulation import run_simulation
+
+# Define a configuration with 10 players:
+# 7 town players and 3 mafia players.
+quick_config = {
+    "roles": [
+        # Town roles (7 players)
+        {"name": "Alice",   "role": "Cop"},
+        {"name": "Bob",     "role": "Doctor"},
+        {"name": "Charlie", "role": "Villager"},
+        {"name": "David",   "role": "Villager"},
+        {"name": "Eve",     "role": "Villager"},
+        {"name": "Faythe",  "role": "Villager"},
+        {"name": "Grace",   "role": "Villager"},
+        # Mafia roles (3 players)
+        {"name": "Heidi",   "role": "Godfather"},
+        {"name": "Ivan",    "role": "Goon"},
+        {"name": "Judy",    "role": "Goon"}
+    ],
+    # Map all agents to the rule-based agent for testing.
+    "agent_mapping": {
+        "Alice": "rule",
+        "Bob": "rule",
+        "Charlie": "rule",
+        "David": "rule",
+        "Eve": "rule",
+        "Faythe": "rule",
+        "Grace": "rule",
+        "Heidi": "rule",
+        "Ivan": "rule",
+        "Judy": "rule"
+    },
+    # Set up strategies:
+    # For town: always accuse in day discussion and always vote guilty in final vote.
+    # For mafia: always perform their night kill action and (optionally) always vote innocent.
+    "agent_strategy": {
+        # These strategies are read by the RuleAgent in its logic:
+        # (The rule agent code checks "always_accuse", "always_vote_guilty", etc.)
+        "always_accuse": True,         # All agents will try to accuse when possible.
+        "always_vote_guilty": True,     # Town agents vote guilty on trial.
+        "always_vote_innocent": True    # Mafia agents vote innocent.
+    },
+    # Override or add any other configuration options:
+    "max_steps": 200,  # Increase max steps if needed to allow game termination.
+    # For testing, we force the environment to transition to day immediately:
+    #"force_day_on_start": True  
+}
+
+# An empty agent config (could be extended later)
+agent_config = {}
+
+if __name__ == "__main__":
+    print("=== Running a quick Mafia test game with 10 rule agents (7 town, 3 mafia) ===")
+    summary = run_simulation(quick_config, agent_config)
+    print("\n=== Game Summary ===")
+    for key, value in summary.items():
+        print(f"{key}: {value}")
+
+
+# === mafia\rewards.py ===
 # mafia/rewards.py
 from typing import Dict
-from mafia.enums import Faction
+from llm_games.mafia.enums import Faction
 
 
 def assign_endgame_rewards(game_state) -> Dict[str, float]:
@@ -1645,363 +1717,456 @@ def assign_question_reward(asker, target, game_state) -> float:
     return 0.2
 
 
-# === simulation.py ===
+# === mafia\simulation.py ===
 import os
 import json
-from tqdm import tqdm
-# Use correct Environment class name
-from mafia.environment import MafiaEnvironment
-# Import role classes and helper
-from mafia.mechanics.roles import get_role_class, Role
-from mafia.player import Player
-# Keep TokenTracker import, assume it exists or create dummy
-# from mafia.utils.token_cost import TokenTracker # If using
-# Import agent classes
-from mafia.agents.rule_agent import RuleBasedAgent # Assuming this will exist
-from mafia.agents.llm_agent import LLMAPIClientAgent # Import the LLM agent
-from typing import Dict, List
 import uuid
+from typing import Dict, List, Optional
 
-# Dummy Token Tracker if needed
+from tqdm import tqdm
+
+from llm_games.mafia.environment import MafiaEnvironment
+from llm_games.mafia.player import Player
+from llm_games.mafia.mechanics.roles import get_role_class
+from llm_games.mafia.agents.rule_agent import RuleAgent
+from llm_games.mafia.agents.llm_agent import LLMAgent
+from llm_games.mafia.enums import GamePhase
+
+
 class TokenTracker:
-    def __init__(self): self.usage = {}
-    def update(self, *args, **kwargs): pass
-    def to_dict(self): return self.usage
+    def __init__(self):
+        self.usage = {}
+
+    def update(self, *args, **kwargs):
+        pass
+
+    def to_dict(self) -> Dict[str, Dict[str, int]]:
+        return self.usage
+
+
+def load_config_from_file(path: str) -> Dict:
+    print(f"Attempting to load config from {path} (stub).")
+    return {}
+
 
 def create_players_from_config(config: Dict) -> List[Player]:
-    """Creates Player objects based on a configuration dictionary."""
     players = []
-    roles_config = config.get("roles", []) # e.g., [{"name": "Player1", "role": "Cop"}, ...]
-    if not roles_config: # Fallback to default if config is empty/missing roles
+    roles_config = config.get("roles", [])
+    if not roles_config:
         roles_setup = [
-            ("Player1", "Cop"), ("Player2", "Doctor"), ("Player3", "Villager"),
-            ("Player4", "Godfather"), ("Player5", "Goon")
+            ("Player1", "Cop"),
+            ("Player2", "Doctor"),
+            ("Player3", "Villager"),
+            ("Player4", "Godfather"),
+            ("Player5", "Goon")
         ]
         print("Warning: Using default 5-player role setup.")
     else:
-        roles_setup = [(p_cfg["name"], p_cfg["role"]) for p_cfg in roles_config]
+        roles_setup = [(entry["name"], entry["role"]) for entry in roles_config]
 
     for name, role_name in roles_setup:
         RoleClass = get_role_class(role_name)
         if not RoleClass:
-             raise ValueError(f"Unknown role name '{role_name}' in configuration.")
+            raise ValueError(f"Unknown role name '{role_name}' in configuration.")
         role_instance = RoleClass()
         player = Player(name=name, role=role_instance)
 
-        # --- Agent Assignment ---
-        # Example: Assign agents based on config or default to RuleBased
-        agent_type = config.get("agent_mapping", {}).get(name, "rule") # Default to rule-based
+        agent_type = config.get("agent_mapping", {}).get(name, "rule").lower()
+        if agent_type == "llm":
+            model_name = config.get("llm_config", {}).get("model", "gpt-3.5-turbo")
+            system_prompt = (
+                f"You are {name}, playing Mafia as {role_instance.name}. "
+                f"{role_instance.get_role_description()}"
+            )
 
-        if agent_type.lower() == "llm":
-            # TODO: Get model name, system prompt from config
-            model_name = config.get("llm_config", {}).get("model", "gpt-4") # Example default
-            system_prompt_key = config.get("llm_config", {}).get("system_prompt_key", "default_mafia")
-            # Need a way to load system prompts based on key
-            system_prompt = f"You are {name}, playing Mafia as {role_instance.name}. {role_instance.get_role_description()}" # Basic example
-            agent = LLMAPIClientAgent(name=name, model=model_name, system_prompt=system_prompt)
-            print(f"Assigning LLM Agent ({model_name}) to {name}")
-        else: # Default to RuleBasedAgent
-             # RuleBasedAgent needs to be implemented
-            agent = RuleBasedAgent(name=name, player_role=role_instance.name)
-            print(f"Assigning Rule Agent to {name}")
+            def dummy_model_backend(prompt: str) -> str:
+                return '{"action": "pass"}'
 
-        # Link agent to player (though environment might manage this)
-        player.agent = agent # Store agent reference if needed directly by player, otherwise managed by env/runner
+            agent = LLMAgent(
+                name=name,
+                model_backend=dummy_model_backend,
+                tokenizer=None,
+                config={"system_prompt": system_prompt, "model": model_name}
+            )
+            print(f"Assigning LLM-based Agent to {name} ({role_name})")
+        else:
+            strategy = config.get("agent_strategy", {})
+            agent = RuleAgent(name=name, role=role_instance.name, strategy=strategy)
+            print(f"Assigning RuleAgent to {name} ({role_name})")
+
+        player.agent = agent
         players.append(player)
 
     return players
 
 
+def log_game_summary(game_state) -> Dict:
+    return {
+        "game_id": game_state.game_id,
+        "winner": game_state.winner.value if game_state.winner else None,
+        "final_roles": game_state.final_player_roles,
+        "day_count": game_state.day_count
+    }
+
+
 def run_simulation(game_config: Dict, agent_config: Dict) -> Dict:
-    """Runs a single game simulation and returns the final state."""
     print(f"\n--- Starting Simulation Game ID: {game_config.get('game_id', 'N/A')} ---")
+    combined_config = {**game_config, "agents": agent_config}
 
-    # Combine configs or pass separately
-    full_config = {**game_config, "agents": agent_config} # Example merge
+    players = create_players_from_config(combined_config)
+    env = MafiaEnvironment(players=players, config=combined_config)
 
-    # Create players based on combined config
-    players = create_players_from_config(full_config) # Pass merged config
+    if env.state.phase != GamePhase.NIGHT:
+        env.state.phase = GamePhase.NIGHT
+    print("Game begins at Night (Day 0). Agents may converse/pass; initial kills occur here if applicable.")
 
-    # Initialize environment
-    # Pass game_config to environment if it needs rules like GF detectability
-    env = MafiaEnvironment(players=players, config=full_config)
-    token_tracker = TokenTracker() # Initialize token tracker if used
-
-    # --- Game Loop ---
-    max_steps = full_config.get("max_steps", 100) # Limit game length
+    token_tracker = TokenTracker()
+    max_steps = combined_config.get("max_steps", 100)
     step_count = 0
+
     while not env.state.game_over and step_count < max_steps:
         step_count += 1
-        print(f"\n=== Day {env.state.day_count} | Phase: {env.state.phase.name} | Turn: {env.state.turn_number_in_phase} ===")
-        current_player_name = env.get_current_player_name() # Needs implementation in Env
+        print(f"\n=== [Step {step_count}] Day {env.state.day_count}, Phase: {env.state.phase.name}, Turn: {env.state.turn_number_in_phase} ===")
 
+        current_phase = env.state.phase
+        current_player_name = env.get_current_player_name()
+
+        # Final vote is non-turn-based: every alive player votes
+        if current_phase == GamePhase.FINAL_VOTE:
+            for name in env.state.alive_players:
+                player = env.state.get_player(name)
+                if not player or not player.alive:
+                    continue
+                obs = env.get_observation(name)
+                player.agent.observe(obs)
+                act = player.agent.act()
+                print(f"{name} votes: {act}")
+                env.process_player_action(name, act)
+            env.step_phase()
+            continue
+
+        # Other phases
         if not current_player_name:
-            # Environment handles transition or phase resolution automatically
-             print("Environment resolving phase...")
-             env.step_phase() # Needs implementation in Env
-             continue # Go to next loop iteration to check game state
+            print("No current player; environment resolving phase...")
+            env.step_phase()
+            continue
 
         player = env.state.get_player(current_player_name)
         if not player or not player.alive:
-             print(f"Skipping turn for {current_player_name} (dead or invalid).")
-             env.advance_turn() # Needs implementation in Env
-             continue
+            print(f"Skipping turn for {current_player_name} (dead or invalid).")
+            env.advance_turn()
+            continue
 
-        agent = player.agent # Get agent associated with the player
+        observation = env.get_observation(current_player_name)
+        agent = player.agent
+        agent.observe(observation)
+        agent_action = agent.act()
+        print(f"{current_player_name} (role={player.role.name}) chooses: {agent_action}")
 
-        # Get observation for the current player
-        observation = env.get_observation(current_player_name) # Needs implementation in Env
-
-        # Agent decides action
-        print(f"--- {current_player_name}'s Turn ({agent.__class__.__name__}) ---")
-        action = agent.act(observation) # Agent returns action dict
-        print(f"Action chosen: {action}")
-
-        # Environment processes action
-        success = env.process_player_action(current_player_name, action) # Needs implementation in Env
+        success = env.process_player_action(current_player_name, agent_action)
         if not success:
-            print(f"Action {action} failed or was invalid.")
+            print(f"Action failed or was invalid: {agent_action}")
+        else:
+            env.advance_turn()
 
-        # Optional: Track tokens
-        # token_tracker.update(current_player_name, observation, action)
+    print("\n=== Game Over ===")
+    winner_str = env.state.winner.value if env.state.winner else "No winner / Undecided"
+    print(f"Winner: {winner_str}")
+    print(f"Ended on Day {env.state.day_count}, Phase: {env.state.phase.name}")
 
-        # Environment potentially advances turn or phase based on action
-        # This might happen inside process_player_action or require a separate env.advance() call
-
-    print(f"\n--- Game Over ---")
-    print(f"Winner: {env.state.winner.value if env.state.winner else 'Draw/Timeout'}")
-    print(f"Ended on Day {env.state.day_count}, Phase {env.state.phase.name}")
-
-    # Log final state and return results
-    final_state_summary = log_game_summary(env.state) # Use analysis function
-    final_state_summary["tokens_used"] = token_tracker.to_dict() # Add token info if tracked
-    return final_state_summary
+    summary = log_game_summary(env.state)
+    summary["tokens_used"] = token_tracker.to_dict()
+    return summary
 
 
-def run_multiple_simulations(num_games=10, config_path="config/default_game.json", save_dir="data/episodes"):
-    """Runs multiple simulations based on a config file."""
+def run_multiple_simulations(num_games: int = 5,
+                             config_path: str = "config/default_game.json",
+                             save_dir: str = "output/sim_results"):
     os.makedirs(save_dir, exist_ok=True)
-
-    # Load base configuration (needs implementation)
-    # base_game_config = load_config_from_file(config_path)
-    # base_agent_config = base_game_config.get("agent_config", {}) # Separate agent config if needed
-    base_game_config = {"roles": [ # Example default config
-             {"name": "Player1", "role": "Cop"}, {"name": "Player2", "role": "Doctor"},
-             {"name": "Player3", "role": "Villager"}, {"name": "Player4", "role": "Godfather"},
-             {"name": "Player5", "role": "Goon"}
-         ],
-        "agent_mapping": {"Player1": "llm", "Player4": "llm"}, # P1 & P4 are LLMs
-        "llm_config": {"model": "gpt-3.5-turbo"} # Example LLM config
-     }
-    base_agent_config = {} # Agent specific settings if needed
-
+    base_game_config = load_config_from_file(config_path)
+    if not base_game_config:
+        base_game_config = {
+            "roles": [
+                {"name": "Player1", "role": "Cop"},
+                {"name": "Player2", "role": "Doctor"},
+                {"name": "Player3", "role": "Villager"},
+                {"name": "Player4", "role": "Godfather"},
+                {"name": "Player5", "role": "Goon"}
+            ],
+            "agent_mapping": {
+                "Player1": "llm",
+                "Player4": "llm"
+            },
+            "llm_config": {"model": "gpt-3.5-turbo"},
+            "max_steps": 100
+        }
+    base_agent_config = {}
 
     game_results = []
-    for i in tqdm(range(num_games), desc="Simulating Games"):
+    log_file = os.path.join(save_dir, "games_log.jsonl")
+
+    for _ in tqdm(range(num_games), desc="Simulating Games"):
         game_id = str(uuid.uuid4())
         current_game_config = {**base_game_config, "game_id": game_id}
-        # Add variations here if doing experiments (e.g., change roles, prompts)
-
         try:
             result = run_simulation(current_game_config, base_agent_config)
+            result["game_id"] = game_id
             game_results.append(result)
-
-            # Save individual game logs as JSONL
-            log_path = os.path.join(save_dir, "games_log.jsonl")
-            with open(log_path, "a") as f:
+            with open(log_file, "a", encoding="utf-8") as f:
                 json.dump(result, f)
                 f.write("\n")
-
         except Exception as e:
             print(f"\n!!!!!! Error during simulation {game_id} !!!!!!")
             print(f"Error: {e}")
-            # Log error state if possible
             error_info = {"game_id": game_id, "status": "error", "error_message": str(e)}
-            log_path = os.path.join(save_dir, "games_log.jsonl")
-            with open(log_path, "a") as f:
+            with open(log_file, "a", encoding="utf-8") as f:
                 json.dump(error_info, f)
                 f.write("\n")
 
-
-    print(f"\n--- Simulation Run Complete ---")
-    print(f"Saved {len(game_results)} game logs to {os.path.join(save_dir, 'games_log.jsonl')}")
-
-    # --- Optional: Compute and print aggregate metrics ---
-    # win_rates = compute_win_rate(game_results)
-    # avg_tokens = compute_average_tokens(game_results)
-    # avg_accuracy = compute_average_role_accuracy(game_results)
-    # print("\nAggregate Metrics:")
-    # print(f"Win Rates: {win_rates}")
-    # print(f"Avg Tokens: {avg_tokens}")
-    # print(f"Avg Role Accuracy: {avg_accuracy}")
+    print(f"\n=== Simulations Complete ===\nSaved {len(game_results)} game logs to {log_file}")
 
 
-# Helper for loading config (placeholder)
-def load_config_from_file(path: str) -> Dict:
-     print(f"Warning: Config loading not implemented. Using defaults. Tried path: {path}")
-     # Implement actual JSON/YAML loading here
-     return {}
-
-
-# Need log_game_summary, compute_* from evaluation module
-# Placeholder if not implemented yet
-def log_game_summary(game_state): return {"game_id": game_state.game_id, "winner": game_state.winner.value if game_state.winner else None, "final_roles": game_state.final_player_roles}
-# def compute_win_rate(results): return {}
-# def compute_average_tokens(results): return {}
-# def compute_average_role_accuracy(results): return 0.0
+def main():
+    run_multiple_simulations(num_games=3)
 
 
 if __name__ == "__main__":
-    # Example of how to run
-    run_multiple_simulations(num_games=5, save_dir="output/sim_results")
+    main()
 
 
-# === __init__.py ===
+# === mafia\__init__.py ===
 
 
-# === agents\base.py ===
+# === mafia\agents\base_agent.py ===
+# === mafia/agents/base_agent.py ===
+
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 
 class BaseAgent(ABC):
+    """
+    Base abstract agent class for Mafia.
+    Each agent must at least implement:
+      - observe(observation): to receive environment state
+      - act(): to return an action dictionary
+      - reset(): optional, if the agent needs to reset between games
+    """
     def __init__(self, name: str):
-        self.name = name
+        self.name = name  # The agent’s name (should match player.name, but not strictly required)
 
     @abstractmethod
     def observe(self, observation: Dict[str, Any]):
-        """Receive an observation from the environment."""
+        """
+        Called by the environment or simulation to present the agent with
+        the current game observation (public messages, roles, day/phase info, etc.).
+        The agent should store it internally for decision making.
+        """
         pass
 
     @abstractmethod
     def act(self) -> Dict[str, Any]:
-        """Produce an action dictionary in response to the last observation."""
+        """
+        Called after the agent has observed the environment state and must
+        produce an action dictionary, e.g. {"action": "accuse", "target": "Alice"}.
+        """
         pass
 
     def reset(self):
-        """Reset internal memory/state if needed between games."""
+        """
+        Optional: Clear internal memory or states if needed between episodes/games.
+        """
         pass
 
 
-# === agents\llm_agent.py ===
-from typing import Dict, Any
+# === mafia\agents\llm_agent.py ===
+# === mafia/agents/llm_agent.py ===
+
 import json
-from mafia.agents.base import BaseAgent
+from typing import Dict, Any, Optional
+from llm_games.mafia.agents.base_agent import BaseAgent
 
 class LLMAgent(BaseAgent):
-    def __init__(self, name, model_backend, tokenizer=None, config=None):
+    """
+    A base LLM-powered agent that can interact with the environment
+    using local or API-based model backends.
+    """
+    def __init__(self,
+                 name: str,
+                 model_backend: callable,
+                 tokenizer: Optional[callable] = None,
+                 config: Optional[Dict[str, Any]] = None):
+        """
+        :param name: Agent/player name
+        :param model_backend: A callable that takes a string prompt and returns a string
+        :param tokenizer: Optional tokenizer if needed (e.g. for measuring token usage)
+        :param config: Additional config for prompts, temperature, etc.
+        """
         super().__init__(name)
-        self.model_backend = model_backend  # API or local callable
+        self.model_backend = model_backend
         self.tokenizer = tokenizer
         self.config = config or {}
-        self.last_obs = None
+        self.last_observation: Optional[Dict[str, Any]] = None
 
     def observe(self, observation: Dict[str, Any]):
-        self.last_obs = observation
+        self.last_observation = observation
 
     def act(self) -> Dict[str, Any]:
-        prompt = self.build_prompt(self.last_obs)
-        output = self.model_backend(prompt)
-        action = self.parse_action(output)
+        if not self.last_observation:
+            return {"action": "pass"}
+
+        prompt = self.build_prompt(self.last_observation)
+        raw_output = self.model_backend(prompt)
+        action = self.parse_action(raw_output)
         return action
 
     def build_prompt(self, obs: Dict[str, Any]) -> str:
-        # Could be JSON, natural language, or both
-        return f"<Observation>\n{obs}\n</Observation>\n<Action>"
+        """
+        Convert the environment observation into a textual prompt for the LLM.
+        This method can be customized or replaced with chain-of-thought or JSON-based instructions.
+        """
+        # A simple example: show the day/phase, who’s alive, last messages, etc.
+        # Then instruct the model to pick an action.
+        lines = []
+        lines.append(f"You are {self.name}, playing the game of Mafia.")
+        lines.append(f"Current Phase: {obs.get('phase', 'unknown')}, Day {obs.get('day', 0)}")
+        lines.append("Alive Players: " + ", ".join(obs.get("alive_players", [])))
+        lines.append("Dead Players: " + ", ".join(obs.get("dead_players", [])))
+        lines.append("Recent Messages:")
+        for msg in obs.get("messages", []):
+            lines.append(f"  - {msg}")
+        lines.append("Based on the above, choose your next action in JSON format.")
+        lines.append('Example: {"action": "accuse", "target": "Bob"}')
+
+        return "\n".join(lines)
 
     def parse_action(self, response: str) -> Dict[str, Any]:
-        # Basic parsing with regex or structured JSON output
+        """
+        Try to parse the LLM’s output as JSON. If parsing fails or fields are missing,
+        default to {"action": "pass"}.
+        """
         try:
-            return json.loads(response)
-        except:
+            data = json.loads(response)
+            # Validate minimal structure
+            if "action" not in data:
+                return {"action": "pass"}
+            return data
+        except json.JSONDecodeError:
             return {"action": "pass"}
 
 
-# === agents\rule_agent.py ===
+# === mafia\agents\rule_agent.py ===
 import random
 from typing import Dict, Any, Optional
-from mafia.agents.base_agent import BaseAgent
+from llm_games.mafia.agents.base_agent import BaseAgent
 
 class RuleAgent(BaseAgent):
-    def __init__(self, name: str, role: Optional[str] = None, strategy: Optional[Dict[str, Any]] = None, seed: Optional[int] = None):
+    """
+    A deterministic/strategy-based agent for testing.
+    Useful for verifying environment correctness before using complex LLM behavior.
+    """
+    def __init__(self,
+                 name: str,
+                 role: Optional[str] = None,
+                 strategy: Optional[Dict[str, Any]] = None,
+                 seed: Optional[int] = None):
         super().__init__(name)
-        self.role = role
+        self.player_role = (role or "").lower()
         self.strategy = strategy or {}
-        self.last_obs = None
         self.rng = random.Random(seed)
+        self.last_observation: Optional[Dict[str, Any]] = None
+        self.max_discussion_turns = self.strategy.get("max_discussion_turns", 2)
 
     def observe(self, observation: Dict[str, Any]):
-        self.last_obs = observation
+        self.last_observation = observation
 
     def act(self) -> Dict[str, Any]:
-        if not self.last_obs:
+        if not self.last_observation:
             return {"action": "pass"}
-
-        phase = self.last_obs["phase"]
-        if phase == "NIGHT":
+        phase = self.last_observation.get("phase", "").lower()
+        if phase == "night":
             return self._night_action()
-        elif phase == "DAY_DISCUSSION":
+        elif phase == "day_discussion":
             return self._day_discussion_action()
-        elif phase == "DEFENSE":
+        elif phase == "defense":
             return self._defense_action()
-        elif phase == "FINAL_VOTE":
+        elif phase == "final_vote":
             return self._final_vote_action()
-        return {"action": "pass"}
+        else:
+            return self._fallback_action()
+
+    # ---------- Private Phase Logic ----------
 
     def _night_action(self) -> Dict[str, Any]:
-        role = self.role.lower() if self.role else ""
-        targets = [p for p in self.last_obs["alive_players"] if p != self.name]
-
-        if not targets:
+        
+        alive = self.last_observation.get("alive_players", [])
+        if not alive:
             return {"action": "pass"}
 
-        if role == "cop":
-            return {"action": "investigate", "target": self._choose_target(targets)}
-        if role == "doctor":
+        if self.player_role == "cop":
+            target = self._choose_target(alive)
+            return {"action": "investigate", "target": target}
+        elif self.player_role == "doctor":
             return {"action": "protect", "target": self.name}
-        if role == "godfather":
-            target = self._choose_target(targets)
-            if target in self.last_obs.get("faction_members", []):
-                return {"action": "pass"}  # prevent killing mafia
+        elif self.player_role == "godfather":
+            # Use mafia_members from observation (should be provided to mafia agents)
+            mafia_members = self.last_observation.get("mafia_members", [])
+            target_candidates = [p for p in alive if p not in mafia_members and p != self.name]
+            if not target_candidates:
+                return {"action": "pass"}
+            target = self._choose_target(target_candidates)
             return {"action": "kill", "target": target}
         return {"action": "pass"}
 
     def _day_discussion_action(self) -> Dict[str, Any]:
-        # Example: deterministic logic based on strategy
-        s = self.strategy
+        # Do not accuse if someone is already on trial
+        if self.last_observation.get("player_on_trial"):
+            return {"action": "pass"}
 
-        # Accuse if allowed
-        if not self.last_obs["player_on_trial"] and not self.last_obs.get("has_accused_today"):
-            if s.get("always_accuse", False):
-                target = self._choose_target(self.last_obs["alive_players"])
+        # With some probability, issue an accusation (if it's our turn)
+        if self.last_observation.get("is_current_turn", False) and self.rng.random() < 0.5:
+            alive = self.last_observation.get("alive_players", [])
+            if alive:
+                target = self._choose_target(alive)
                 return {"action": "accuse", "target": target}
 
-        # Respond to questions
-        if self.last_obs.get("is_current_turn"):
-            return {"action": "speak", "content": f"{self.name} says something generic."}
+        # Otherwise, if it's our turn, speak
+        if self.last_observation.get("is_current_turn", False):
+            return {"action": "speak", "content": f"{self.name} says something insightful."}
 
         return {"action": "pass"}
 
     def _defense_action(self) -> Dict[str, Any]:
-        return {"action": "speak", "content": f"{self.name} defends themselves with honor."}
+        if self.last_observation.get("player_on_trial") == self.name:
+            return {"action": "speak", "content": f"{self.name} defends themselves."}
+        return {"action": "pass"}
 
     def _final_vote_action(self) -> Dict[str, Any]:
-        s = self.strategy
-        if s.get("always_vote_guilty"):
+        if self.strategy.get("always_vote_guilty"):
             return {"action": "vote", "vote_type": "final_guilty"}
-        if s.get("always_vote_innocent"):
+        elif self.strategy.get("always_vote_innocent"):
             return {"action": "vote", "vote_type": "final_innocent"}
-        return {"action": "vote", "vote_type": self.rng.choice(["final_guilty", "final_innocent"])}
+        choice = self.rng.choice(["final_guilty", "final_innocent", "abstain"])
+        return {"action": "vote", "vote_type": choice}
 
-    def _choose_target(self, candidates: list[str]) -> str:
-        # Deterministic by sorting, or use seeded RNG
-        candidates = [p for p in candidates if p != self.name]
-        return self.rng.choice(candidates) if candidates else self.name
+    def _fallback_action(self) -> Dict[str, Any]:
+        return {"action": "pass"}
+
+    # ---------- Helpers ----------
+    def _choose_target(self, candidates: list) -> str:
+        if not candidates:
+            return self.name
+        return self.rng.choice(candidates)
+
+    @property
+    def _alive_players(self) -> list:
+        obs_alive = self.last_observation.get("alive_players", [])
+        return [p for p in obs_alive if p != self.name]
 
 
-# === agents\__init__.py ===
+# === mafia\agents\__init__.py ===
 
 
-# === evaluation\analysis.py ===
+# === mafia\evaluation\analysis.py ===
 # mafia/evaluation/analysis.py
 from typing import List, Dict
 
@@ -2063,7 +2228,7 @@ def log_game_summary(game_state) -> Dict:
     return summary
 
 
-# === evaluation\metrics.py ===
+# === mafia\evaluation\metrics.py ===
 # mafia/evaluation/metrics.py
 from collections import defaultdict
 from typing import Dict, List
@@ -2121,11 +2286,33 @@ def compute_average_role_accuracy(games: List[Dict]) -> float:
     return correct / total if total else 0.0
 
 
-# === mechanics\messaging.py ===
+# === mafia\mechanics\messaging.py ===
 # mafia/mechanics/messaging.py
-from typing import Dict, List, Optional, Tuple
-from mafia.enums import Phase
+from typing import Dict, List, Optional, Tuple, Any
 
+from dataclasses import dataclass, field
+from llm_games.mafia.enums import GamePhase
+
+@dataclass
+class GameMessage:
+    """Structured record of a single game message."""
+    msg_type: str       # e.g. 'system', 'public', 'whisper', ...
+    sender: str         # 'system' or player_name
+    content: str
+    recipients: Optional[List[str]] = None  # None means public
+    phase: GamePhase = GamePhase.NIGHT
+    day: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a serializable dict (helpful if you store logs as JSON)."""
+        return {
+            "type": self.msg_type,
+            "sender": self.sender,
+            "content": self.content,
+            "recipients": self.recipients,
+            "phase": self.phase.name,
+            "day": self.day
+        }
 class Message:
     def __init__(self, sender: str, content: str, target: Optional[str] = None, private: bool = False):
         self.sender = sender              # Who sent the message
@@ -2155,7 +2342,7 @@ class MessagingSystem:
         self.history.append(msg)
         return msg
 
-    def get_visible_messages(self, player_name: str, phase: Phase) -> List[str]:
+    def get_visible_messages(self, player_name: str, phase: GamePhase) -> List[str]:
         visible = []
         for msg in self.history:
             if not msg.private:
@@ -2179,17 +2366,17 @@ class MessagingSystem:
         } for msg in self.history]
 
 
-# === mechanics\roles.py ===
+# === mafia\mechanics\roles.py ===
 # === mafia/mechanics/roles.py ===
 
 from abc import ABC, abstractmethod
-from mafia.enums import Faction
+from llm_games.mafia.enums import Faction
 from typing import Optional, TYPE_CHECKING, Dict, Any, List
 
 # Avoid circular import for type hinting
 if TYPE_CHECKING:
-    from mafia.player import Player
-    from mafia.game_state import GameState
+    from llm_games.mafia.player import Player
+    from llm_games.mafia.game_state import GameState
 
 class Role(ABC):
     def __init__(self, name: str, faction: Faction):
@@ -2420,102 +2607,10 @@ def get_role_class(role_name: str) -> Optional[type[Role]]:
     return ROLE_CLASS_MAP.get(role_name.lower())
 
 
-# === mechanics\voting.py ===
-# mafia/mechanics/voting.py
-from typing import Dict, Optional
-from mafia.enums import Phase
-from mafia.game_state import GameState
+# === mafia\mechanics\__init__.py ===
 
 
-def cast_vote(game_state: GameState, voter: str, target: str) -> None:
-    """Player casts or changes vote for someone."""
-    if game_state.phase != Phase.DAY or voter not in game_state.alive_players:
-        return
-
-    # Remove old vote if it exists
-    if voter in game_state.voting_targets:
-        prev_target = game_state.voting_targets[voter]
-        if prev_target != target:
-            game_state.messages.append(f"{voter} changed their vote from {prev_target} to {target}.")
-    else:
-        game_state.messages.append(f"{voter} has voted for {target}.")
-
-    game_state.voting_targets[voter] = target
-    check_accusation_threshold(game_state)
-
-
-def retract_vote(game_state: GameState, voter: str) -> None:
-    """Player retracts their vote."""
-    if voter in game_state.voting_targets:
-        prev = game_state.voting_targets.pop(voter)
-        game_state.messages.append(f"{voter} retracted their vote on {prev}.")
-
-
-def check_accusation_threshold(game_state: GameState, threshold: float = 0.5) -> None:
-    """Automatically trigger accusation if a player reaches vote threshold."""
-    vote_counts: Dict[str, int] = {}
-    for target in game_state.voting_targets.values():
-        vote_counts[target] = vote_counts.get(target, 0) + 1
-
-    total_voters = len(game_state.alive_players)
-    for target, count in vote_counts.items():
-        if count / total_voters >= threshold and game_state.accused_player != target:
-            game_state.accused_player = target
-            game_state.messages.append(f"{target} has been accused and must now defend themselves.")
-
-
-def confirm_lynch_vote(game_state: GameState, voter: str, confirm: bool) -> None:
-    """Player confirms or denies the lynch after accusation."""
-    if game_state.phase != Phase.DAY or not game_state.accused_player:
-        return
-
-    game_state.lynch_confirm_votes[voter] = confirm
-    yes_votes = sum(1 for vote in game_state.lynch_confirm_votes.values() if vote)
-    no_votes = sum(1 for vote in game_state.lynch_confirm_votes.values() if not vote)
-
-    total_voters = len(game_state.alive_players)
-    if yes_votes > total_voters // 2:
-        game_state.messages.append(f"{game_state.accused_player} has been lynched by majority vote.")
-        game_state.kill_player(game_state.accused_player)
-        game_state.reset_votes()
-    elif no_votes >= total_voters // 2:
-        game_state.messages.append(f"{game_state.accused_player} has survived the vote.")
-        game_state.reset_votes()
-
-
-# --------------------------
-# Whisper Mechanics
-# --------------------------
-
-def whisper(game_state: GameState, sender: str, recipient: str, message: str) -> None:
-    """Send a whisper from one player to another. Hidden from all other agents."""
-    if sender not in game_state.alive_players or recipient not in game_state.alive_players:
-        return
-
-    # Track hidden message to sender and recipient
-    for player in game_state.players:
-        if player.name in {sender, recipient}:
-            player.log_hidden(game_state, f"[WHISPER] {sender} → {recipient}: {message}")
-        else:
-            player.log_hidden(game_state, f"[WHISPER] {sender} → {recipient}: <hidden>")
-
-    # Log public metadata
-    game_state.messages.append(f"{sender} whispered to {recipient}.")
-
-
-# --------------------------
-# Voting Visibility
-# --------------------------
-
-def get_vote_visibility(game_state: GameState) -> Dict[str, str]:
-    """Return a dict of current votes (publicly visible for now)."""
-    return {voter: target for voter, target in game_state.voting_targets.items()}
-
-
-# === mechanics\__init__.py ===
-
-
-# === prompts\mafia_template.py ===
+# === mafia\prompts\mafia_template.py ===
 def format_prompt(name: str, obs: dict) -> str:
     # Format as readable context for the agent
     lines = [f"Day {obs['day']} | Phase: {obs['phase']}"]
@@ -2540,6 +2635,6 @@ def parse_response(response: str) -> dict:
     }
 
 
-# === utils\token_cost.py ===
+# === mafia\utils\token_cost.py ===
 
 

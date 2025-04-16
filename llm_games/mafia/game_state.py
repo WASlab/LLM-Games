@@ -375,6 +375,15 @@ class GameState:
     # ----------------------------------------------------------------
 
     def get_player_observation(self, player_name: str) -> Dict[str, Any]:
+        """
+        Generates a viewpoint for one player, including:
+        - Visible public (and relevant private) messages.
+        - A list of all players with appended status tags:
+            * [DEAD]  if the player is eliminated.
+            * [On Trial]  if the player is currently on trial.
+            * [Mafia] (only visible to mafia players) if the player belongs to the mafia.
+        - Other information about the game state.
+        """
         player = self.get_player(player_name)
         if not player or not player.alive:
             return {
@@ -384,27 +393,45 @@ class GameState:
                 "message": "You are no longer in the game."
             }
 
-        visible_messages = []
-        for msg in self.messages:
-            is_recip_private = (msg.recipients is not None and player_name in msg.recipients)
-            is_sender_private = (msg.sender == player_name and msg.recipients is not None)
-            if (msg.recipients is None) or is_recip_private or is_sender_private:
-                if msg.msg_type == "whisper":
+        # Prepare visible messages as before.
+        visible_messages: List[str] = []
+        for msg_obj in self.messages:
+            # Validate the message object type.
+            if not isinstance(msg_obj, GameMessage):
+                self.log_hidden(player_name, f"Invalid message object (type={type(msg_obj)}): {msg_obj}")
+                continue
+            is_recip_private = (msg_obj.recipients is not None and player_name in msg_obj.recipients)
+            is_sender_private = (msg_obj.sender == player_name and msg_obj.recipients is not None)
+            if (msg_obj.recipients is None) or is_recip_private or is_sender_private:
+                if msg_obj.msg_type == "whisper":
                     if is_sender_private:
-                        visible_messages.append(f"(Whisper to {msg.recipients[0]}) {msg.content}")
+                        visible_messages.append(f"(Whisper to {msg_obj.recipients[0]}) {msg_obj.content}")
                     elif is_recip_private:
-                        visible_messages.append(f"(Whisper from {msg.sender}) {msg.content}")
+                        visible_messages.append(f"(Whisper from {msg_obj.sender}) {msg_obj.content}")
                     else:
-                        visible_messages.append(f"{msg.sender}: {msg.content}")
+                        visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
                 else:
-                    visible_messages.append(f"{msg.sender}: {msg.content}")
+                    visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
 
-        # For mafia players, include the list of alive mafia members
-        if player.faction == Faction.MAFIA:
-            mafia_members = [p.name for p in self.players if p.alive and p.faction == Faction.MAFIA]
-        else:
-            mafia_members = []
+        # Create a formatted player list with status indicators.
+        player_list = []
+        for p in self.players:
+            status_tags = []
+            # Append [DEAD] if the player is not alive.
+            if not p.alive:
+                status_tags.append("DEAD")
+            # Append [On Trial] if p is the player on trial.
+            if self.player_on_trial == p.name:
+                status_tags.append("On Trial")
+            # If the observing player is Mafia, they see their own team tags.
+            observer = self.get_player(player_name)
+            if observer.faction == Faction.MAFIA and p.faction == Faction.MAFIA:
+                status_tags.append("Mafia")
+            # Combine the status tags.
+            status_str = " [" + ", ".join(status_tags) + "]" if status_tags else ""
+            player_list.append(f"{p.name}{status_str}")
 
+        # Build the final observation dict.
         obs = {
             "game_id": self.game_id,
             "player_name": player.name,
@@ -417,7 +444,8 @@ class GameState:
             "is_current_turn": (self.current_player_turn == player.name),
             "alive_players": sorted(list(self.alive_players)),
             "dead_players": sorted(list(self.dead_players)),
-            "messages": visible_messages[-20:],
+            "player_list": player_list,  # Our new formatted player list with statuses
+            "messages": visible_messages[-20:],  # Most recent 20 messages
             "can_speak": player.can_speak(),
             "can_act_tonight": (player.can_act_at_night() and self.phase == GamePhase.NIGHT),
             "player_on_trial": self.player_on_trial,
@@ -427,7 +455,6 @@ class GameState:
             "is_roleblocked": player.is_roleblocked,
             "protected_by": player.protected_by,
             "lynch_votes": {voter: val for voter, val in self.votes_for_lynch.items()},
-            "mafia_members": mafia_members
         }
         return obs
 

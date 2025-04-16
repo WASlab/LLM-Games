@@ -1,0 +1,17 @@
+# LLM-Games/.gitignore
+
+# Python stuff
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env  # <-- Add this line
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Output directories (optional, but good practice)
+output/
