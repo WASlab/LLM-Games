@@ -93,32 +93,44 @@ class Player:
 
     # --- Day Actions ---
 
+       
+    # Day‑time accusation  (now supports switching & vote‑tracking)
+    
     def accuse(self, target: str, game_state: 'GameState') -> bool:
+        """Accuse (or re‑accuse) another player."""
         if not self.can_speak():
             self.log_hidden(game_state, f"Attempted to accuse {target} but cannot speak.")
             return False
+
         target_player = game_state.get_player(target)
         if not target_player or not target_player.alive:
             self.log_hidden(game_state, f"Attempted to accuse {target} but they are dead or invalid.")
             return False
 
-        # Allow re‑accusation: simply log the new accusation
-        if self.has_accused_today:
-            self.log_hidden(game_state, f"Re‑accusing: updating previous accusation to {target}.")
-            # Optionally, update vote counts here if needed (via game_state.update_vote_counts)
-        else:
-            self.has_accused_today = True
+        old_target = game_state.votes_for_accusation.get(self.name)
+        if old_target == target:
+            self.log_hidden(game_state, f"Redundant accusation – already accusing {target}.")
+            return False
 
-        # Instead of appending a raw string, create a GameMessage.
+        # update central tallies
+        game_state.update_vote_counts(self.name, old_target, target)
+        self.has_accused_today = True
+
+        if old_target:
+            public = f"{self.name} accuses {target} and drops their accusation on {old_target}!"
+        else:
+            public = f"{self.name} accuses {target}!"
+
         game_state.messages.append(GameMessage(
             msg_type="public",
             sender=self.name,
-            content=f"{self.name} accuses {target}!",
+            content=public,
             recipients=None,
             phase=game_state.phase,
-            day=game_state.day_count
+            day=game_state.day_count,
         ))
         return True
+
 
 
     def predict_role(self, target: str, predicted_role_name: str, game_state: 'GameState') -> bool:

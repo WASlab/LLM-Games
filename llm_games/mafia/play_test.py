@@ -63,7 +63,11 @@ test_config = {
     "roles": [
         # ... (previous role definitions) ...
         {"name": "Charlie", "role": "Villager", "agent_strategy": {"always_accuse": True, "always_vote_guilty": True}}, # Aggressive Townie
-        {"name": "Ivan",    "role": "Goon",     "agent_strategy": {"claim_role": "Doctor", "always_vote_innocent": True}} # Mafia claiming Doctor
+        {"name": "Ivan",    "role": "Goon",     "agent_strategy": {"claim_role": "Doctor", "always_vote_innocent": True}}, # Mafia claiming Doctor
+        {"name": "Judy",    "role": "Goon",     "agent_strategy": {"always_vote_guilty": True}}, # Passive Goon
+        {"name": "Bob",      "role": "Doctor",   "agent_strategy": {"always_vote_innocent": True}}, # Passive Doctor
+        {"name": "David",   "role": "Villager", "agent_strategy": {"always_vote_guitly": True}}, # Passive Townie
+        
         # Note: The 'claim_role' is a custom strategy key the RuleAgent needs to be programmed to understand.
         #       You'd modify rule_agent.py to handle this. For now, it's illustrative.
     ],
