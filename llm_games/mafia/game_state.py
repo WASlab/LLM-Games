@@ -370,20 +370,11 @@ class GameState:
         }
         self.hidden_log.append(entry)
 
+       # ----------------------------------------------------------------
+    # Personalised observation  (adds “You …” labelling & Q‑prompt)
     # ----------------------------------------------------------------
-    # Observations
-    # ----------------------------------------------------------------
-
     def get_player_observation(self, player_name: str) -> Dict[str, Any]:
-        """
-        Generates a viewpoint for one player, including:
-        - Visible public (and relevant private) messages.
-        - A list of all players with appended status tags:
-            * [DEAD]  if the player is eliminated.
-            * [On Trial]  if the player is currently on trial.
-            * [Mafia] (only visible to mafia players) if the player belongs to the mafia.
-        - Other information about the game state.
-        """
+        """Return a personalised snapshot of the game state."""
         player = self.get_player(player_name)
         if not player or not player.alive:
             return {
@@ -393,46 +384,50 @@ class GameState:
                 "message": "You are no longer in the game."
             }
 
-        # Prepare visible messages as before.
+        # ---------- visible messages ----------
         visible_messages: List[str] = []
-        for msg_obj in self.messages:
-            # Validate the message object type.
-            if not isinstance(msg_obj, GameMessage):
-                self.log_hidden(player_name, f"Invalid message object (type={type(msg_obj)}): {msg_obj}")
+        for msg in self.messages:
+            if not isinstance(msg, GameMessage):
                 continue
-            is_recip_private = (msg_obj.recipients is not None and player_name in msg_obj.recipients)
-            is_sender_private = (msg_obj.sender == player_name and msg_obj.recipients is not None)
-            if (msg_obj.recipients is None) or is_recip_private or is_sender_private:
-                if msg_obj.msg_type == "whisper":
-                    if is_sender_private:
-                        visible_messages.append(f"(Whisper to {msg_obj.recipients[0]}) {msg_obj.content}")
-                    elif is_recip_private:
-                        visible_messages.append(f"(Whisper from {msg_obj.sender}) {msg_obj.content}")
+            recip_ok = msg.recipients and player_name in msg.recipients
+            send_priv = msg.recipients and msg.sender == player_name
+            if msg.recipients is None or recip_ok or send_priv:
+                sender = "You" if msg.sender == player_name else msg.sender
+                if msg.msg_type == "whisper":
+                    if send_priv:
+                        visible_messages.append(f"(Whisper to {msg.recipients[0]}) {msg.content}")
+                    elif recip_ok:
+                        visible_messages.append(f"(Whisper from {msg.sender}) {msg.content}")
                     else:
-                        visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
+                        visible_messages.append(f"{msg.sender}: {msg.content}")
                 else:
-                    visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
+                    visible_messages.append(f"{sender}: {msg.content}")
 
-        # Create a formatted player list with status indicators.
+        # prompt if being questioned
+        if (
+            self.turn_context
+            and self.turn_context.get("answering_question_from")
+            and self.current_player_turn == player_name
+        ):
+            asker = self.turn_context["answering_question_from"]
+            visible_messages.append(
+                f"You have been questioned by {asker}.  Respond now or remain silent."
+            )
+
+        # ---------- player list ----------
         player_list = []
         for p in self.players:
-            status_tags = []
-            # Append [DEAD] if the player is not alive.
+            tags = []
             if not p.alive:
-                status_tags.append("DEAD")
-            # Append [On Trial] if p is the player on trial.
+                tags.append("DEAD")
             if self.player_on_trial == p.name:
-                status_tags.append("On Trial")
-            # If the observing player is Mafia, they see their own team tags.
-            observer = self.get_player(player_name)
-            if observer.faction == Faction.MAFIA and p.faction == Faction.MAFIA:
-                status_tags.append("Mafia")
-            # Combine the status tags.
-            status_str = " [" + ", ".join(status_tags) + "]" if status_tags else ""
-            player_list.append(f"{p.name}{status_str}")
+                tags.append("On Trial")
+            if player.faction == Faction.MAFIA and p.faction == Faction.MAFIA:
+                tags.append("Mafia")
+            suffix = f" [{', '.join(tags)}]" if tags else ""
+            player_list.append(f"{p.name}{suffix}")
 
-        # Build the final observation dict.
-        obs = {
+        return {
             "game_id": self.game_id,
             "player_name": player.name,
             "role": player.role.name,
@@ -442,21 +437,18 @@ class GameState:
             "day": self.day_count,
             "turn": self.turn_number_in_phase,
             "is_current_turn": (self.current_player_turn == player.name),
-            "alive_players": sorted(list(self.alive_players)),
-            "dead_players": sorted(list(self.dead_players)),
-            "player_list": player_list,  # Our new formatted player list with statuses
-            "messages": visible_messages[-20:],  # Most recent 20 messages
+            "alive_players": sorted(self.alive_players),
+            "dead_players": sorted(self.dead_players),
+            "messages": visible_messages[-20:],            # cap for prompt size
             "can_speak": player.can_speak(),
             "can_act_tonight": (player.can_act_at_night() and self.phase == GamePhase.NIGHT),
             "player_on_trial": self.player_on_trial,
             "votes_for_accusation": dict(self.votes_for_accusation),
             "accusation_counts": dict(self.accusation_counts),
-            "memory": list(player.memory),
-            "is_roleblocked": player.is_roleblocked,
-            "protected_by": player.protected_by,
-            "lynch_votes": {voter: val for voter, val in self.votes_for_lynch.items()},
+            "questions_left_today": 3 - self._question_rounds_taken.get(player_name, 0),
+            "player_list": player_list,
         }
-        return obs
+
 
 
     # ----------------------------------------------------------------

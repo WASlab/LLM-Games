@@ -1188,6 +1188,15 @@ class GameState:
     # ----------------------------------------------------------------
 
     def get_player_observation(self, player_name: str) -> Dict[str, Any]:
+        """
+        Generates a viewpoint for one player, including:
+        - Visible public (and relevant private) messages.
+        - A list of all players with appended status tags:
+            * [DEAD]  if the player is eliminated.
+            * [On Trial]  if the player is currently on trial.
+            * [Mafia] (only visible to mafia players) if the player belongs to the mafia.
+        - Other information about the game state.
+        """
         player = self.get_player(player_name)
         if not player or not player.alive:
             return {
@@ -1197,27 +1206,45 @@ class GameState:
                 "message": "You are no longer in the game."
             }
 
-        visible_messages = []
-        for msg in self.messages:
-            is_recip_private = (msg.recipients is not None and player_name in msg.recipients)
-            is_sender_private = (msg.sender == player_name and msg.recipients is not None)
-            if (msg.recipients is None) or is_recip_private or is_sender_private:
-                if msg.msg_type == "whisper":
+        # Prepare visible messages as before.
+        visible_messages: List[str] = []
+        for msg_obj in self.messages:
+            # Validate the message object type.
+            if not isinstance(msg_obj, GameMessage):
+                self.log_hidden(player_name, f"Invalid message object (type={type(msg_obj)}): {msg_obj}")
+                continue
+            is_recip_private = (msg_obj.recipients is not None and player_name in msg_obj.recipients)
+            is_sender_private = (msg_obj.sender == player_name and msg_obj.recipients is not None)
+            if (msg_obj.recipients is None) or is_recip_private or is_sender_private:
+                if msg_obj.msg_type == "whisper":
                     if is_sender_private:
-                        visible_messages.append(f"(Whisper to {msg.recipients[0]}) {msg.content}")
+                        visible_messages.append(f"(Whisper to {msg_obj.recipients[0]}) {msg_obj.content}")
                     elif is_recip_private:
-                        visible_messages.append(f"(Whisper from {msg.sender}) {msg.content}")
+                        visible_messages.append(f"(Whisper from {msg_obj.sender}) {msg_obj.content}")
                     else:
-                        visible_messages.append(f"{msg.sender}: {msg.content}")
+                        visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
                 else:
-                    visible_messages.append(f"{msg.sender}: {msg.content}")
+                    visible_messages.append(f"{msg_obj.sender}: {msg_obj.content}")
 
-        # For mafia players, include the list of alive mafia members
-        if player.faction == Faction.MAFIA:
-            mafia_members = [p.name for p in self.players if p.alive and p.faction == Faction.MAFIA]
-        else:
-            mafia_members = []
+        # Create a formatted player list with status indicators.
+        player_list = []
+        for p in self.players:
+            status_tags = []
+            # Append [DEAD] if the player is not alive.
+            if not p.alive:
+                status_tags.append("DEAD")
+            # Append [On Trial] if p is the player on trial.
+            if self.player_on_trial == p.name:
+                status_tags.append("On Trial")
+            # If the observing player is Mafia, they see their own team tags.
+            observer = self.get_player(player_name)
+            if observer.faction == Faction.MAFIA and p.faction == Faction.MAFIA:
+                status_tags.append("Mafia")
+            # Combine the status tags.
+            status_str = " [" + ", ".join(status_tags) + "]" if status_tags else ""
+            player_list.append(f"{p.name}{status_str}")
 
+        # Build the final observation dict.
         obs = {
             "game_id": self.game_id,
             "player_name": player.name,
@@ -1230,7 +1257,8 @@ class GameState:
             "is_current_turn": (self.current_player_turn == player.name),
             "alive_players": sorted(list(self.alive_players)),
             "dead_players": sorted(list(self.dead_players)),
-            "messages": visible_messages[-20:],
+            "player_list": player_list,  # Our new formatted player list with statuses
+            "messages": visible_messages[-20:],  # Most recent 20 messages
             "can_speak": player.can_speak(),
             "can_act_tonight": (player.can_act_at_night() and self.phase == GamePhase.NIGHT),
             "player_on_trial": self.player_on_trial,
@@ -1240,7 +1268,6 @@ class GameState:
             "is_roleblocked": player.is_roleblocked,
             "protected_by": player.protected_by,
             "lynch_votes": {voter: val for voter, val in self.votes_for_lynch.items()},
-            "mafia_members": mafia_members
         }
         return obs
 
@@ -1595,66 +1622,127 @@ class Player:
 
 
 # === mafia\play_test.py ===
-# play_test.py
+# === mafia/play_test.py ===
 
-from llm_games.mafia.simulation import run_simulation
+# Import the main simulation runner function
+from llm_games.mafia.simulation import run_simulation, run_multiple_simulations
+import os
 
-# Define a configuration with 10 players:
-# 7 town players and 3 mafia players.
-quick_config = {
+# --- Configuration for a Test Game ---
+# This game uses 10 players: 1 LLM Cop, 1 LLM Godfather, and 8 RuleAgents.
+# RuleAgents have specific strategies to test deception and game mechanics.
+test_config = {
     "roles": [
-        # Town roles (7 players)
-        {"name": "Alice",   "role": "Cop"},
-        {"name": "Bob",     "role": "Doctor"},
-        {"name": "Charlie", "role": "Villager"},
-        {"name": "David",   "role": "Villager"},
-        {"name": "Eve",     "role": "Villager"},
-        {"name": "Faythe",  "role": "Villager"},
-        {"name": "Grace",   "role": "Villager"},
-        # Mafia roles (3 players)
-        {"name": "Heidi",   "role": "Godfather"},
-        {"name": "Ivan",    "role": "Goon"},
-        {"name": "Judy",    "role": "Goon"}
+        # Town Roles (7 players)
+        {"name": "Alice",   "role": "Cop"},       # LLM Agent
+        {"name": "Bob",     "role": "Doctor"},    # Rule Agent
+        {"name": "Charlie", "role": "Villager"},  # Rule Agent (Aggressive)
+        {"name": "David",   "role": "Villager"},  # Rule Agent
+        {"name": "Eve",     "role": "Villager"},  # Rule Agent
+        {"name": "Faythe",  "role": "Villager"},  # Rule Agent
+        {"name": "Grace",   "role": "Villager"},  # Rule Agent
+
+        # Mafia Roles (3 players)
+        {"name": "Heidi",   "role": "Godfather"}, # LLM Agent
+        {"name": "Ivan",    "role": "Goon"},      # Rule Agent (Claims Doctor)
+        {"name": "Judy",    "role": "Goon"}       # Rule Agent
     ],
-    # Map all agents to the rule-based agent for testing.
+
+    # Agent Mapping: Specify which player gets which agent type
     "agent_mapping": {
-        "Alice": "rule",
+        "Alice": "llm",      # Cop is an LLM
         "Bob": "rule",
         "Charlie": "rule",
         "David": "rule",
         "Eve": "rule",
         "Faythe": "rule",
         "Grace": "rule",
-        "Heidi": "rule",
+        "Heidi": "llm",      # Godfather is an LLM
         "Ivan": "rule",
         "Judy": "rule"
     },
-    # Set up strategies:
-    # For town: always accuse in day discussion and always vote guilty in final vote.
-    # For mafia: always perform their night kill action and (optionally) always vote innocent.
-    "agent_strategy": {
-        # These strategies are read by the RuleAgent in its logic:
-        # (The rule agent code checks "always_accuse", "always_vote_guilty", etc.)
-        "always_accuse": True,         # All agents will try to accuse when possible.
-        "always_vote_guilty": True,     # Town agents vote guilty on trial.
-        "always_vote_innocent": True    # Mafia agents vote innocent.
+
+    # --- Agent Configurations ---
+
+    # Global LLM Agent Configuration (applied to Alice and Heidi)
+    "llm_agent_config": {
+        "backend_type": "dummy",  # IMPORTANT: Change to "openai", "local_api", etc. for real LLMs
+        "model_identifier": "dummy-llm",
+        # "api_key_env_var": "OPENAI_API_KEY", # Uncomment and set if using OpenAI
+        # "local_api_endpoint": "http://localhost:11434/v1/chat/completions", # Example for Ollama
+        "use_cot": True,         # Enable Chain-of-Thought prompting for LLMs
+        "generation_params": {"temperature": 0.7, "max_tokens": 180}
     },
-    # Override or add any other configuration options:
-    "max_steps": 200,  # Increase max steps if needed to allow game termination.
-    # For testing, we force the environment to transition to day immediately:
-    #"force_day_on_start": True  
+
+    # Global Rule Agent Strategy (base strategy for most rule agents)
+    "rule_agent_strategy": {
+        "always_accuse": False,        # Base rule agents are not overly aggressive
+        "always_vote_guilty": False,   # Base rule agents use random voting logic
+        "always_vote_innocent": False,
+        # Add specific strategies per player below if needed
+    },
+
+    # --- Role/Player Specific Agent Overrides ---
+    # Example: Override strategy for specific rule agents
+    "roles": [
+        # ... (previous role definitions) ...
+        {"name": "Charlie", "role": "Villager", "agent_strategy": {"always_accuse": True, "always_vote_guilty": True}}, # Aggressive Townie
+        {"name": "Ivan",    "role": "Goon",     "agent_strategy": {"claim_role": "Doctor", "always_vote_innocent": True}} # Mafia claiming Doctor
+        # Note: The 'claim_role' is a custom strategy key the RuleAgent needs to be programmed to understand.
+        #       You'd modify rule_agent.py to handle this. For now, it's illustrative.
+    ],
+
+
+    # --- Environment Configuration ---
+    "max_steps": 150,                 # Max simulation steps before timeout
+    "lynch_defense_enabled": True,   # Allow accused players to defend themselves
+    "cop_speaks_first": False,        # Let discussion order be random initially
+    "godfather_detectable": False,   # Godfather appears as Town to Cop
+    "doctor_can_self_heal": True,    # Doctor can target themselves
+
+    # Custom game ID for this test run
+    "game_id": "test_llm_vs_rules_deception_v1"
 }
 
-# An empty agent config (could be extended later)
-agent_config = {}
-
+# --- Main Execution Block ---
 if __name__ == "__main__":
-    print("=== Running a quick Mafia test game with 10 rule agents (7 town, 3 mafia) ===")
-    summary = run_simulation(quick_config, agent_config)
-    print("\n=== Game Summary ===")
-    for key, value in summary.items():
-        print(f"{key}: {value}")
+    print("=== Running Mafia Test Game: 1 LLM Cop, 1 LLM GF vs. 8 Rule Agents ===")
+    print("Rule Agent Strategies:")
+    print("  - Charlie (Villager): Always Accuses, Always Votes Guilty")
+    print("  - Ivan (Goon): Will attempt to claim Doctor (needs RuleAgent update), Votes Innocent")
+    print("  - Others: Standard random/passive rules")
+    print("LLM Agents (Alice & Heidi): Using specified backend (currently Dummy) with CoT prompting.")
 
+    # Run a single simulation with the defined test configuration
+    # The `agent_config` parameter to run_simulation is less used now,
+    # as agent configs are embedded within the main `test_config`.
+    summary = run_simulation(game_config=test_config, agent_config=None) # agent_config=None is fine
+
+    print("\n" + "="*20 + " Game Summary " + "="*20)
+    if summary.get("status") == "error":
+        print("!!! Simulation ended with an error !!!")
+        print(f"Error Message: {summary.get('error_message', 'Unknown error')}")
+    else:
+        # Pretty print the summary dictionary
+        for key, value in summary.items():
+             if key == "token_usage" and isinstance(value, dict):
+                  print(f"{key}:")
+                  for agent, tokens in value.items():
+                       print(f"  - {agent}: Input={tokens.get('input', 0)}, Output={tokens.get('output', 0)}")
+             elif isinstance(value, list):
+                  print(f"{key}: {', '.join(map(str, value))}")
+             else:
+                  print(f"{key}: {value}")
+
+    print("="*54)
+
+    # --- Optional: Run multiple games with this config ---
+    # print("\n=== Running 3 simulations with the same test config ===")
+    # run_multiple_simulations(
+    #     num_games=3,
+    #     base_config=test_config, # Use the config directly
+    #     save_dir="output/test_llm_vs_rules_multi"
+    # )
 
 # === mafia\rewards.py ===
 # mafia/rewards.py
@@ -1718,221 +1806,489 @@ def assign_question_reward(asker, target, game_state) -> float:
 
 
 # === mafia\simulation.py ===
+# === mafia/simulation.py ===
+
 import os
 import json
 import uuid
 from typing import Dict, List, Optional
 
-from tqdm import tqdm
+from tqdm import tqdm # Keep tqdm for progress bars
 
+# Core project imports
 from llm_games.mafia.environment import MafiaEnvironment
 from llm_games.mafia.player import Player
 from llm_games.mafia.mechanics.roles import get_role_class
 from llm_games.mafia.agents.rule_agent import RuleAgent
-from llm_games.mafia.agents.llm_agent import LLMAgent
-from llm_games.mafia.enums import GamePhase
+from llm_games.mafia.agents.llm_agent import LLMAgent # Use the updated LLMAgent
+from llm_games.mafia.enums import GamePhase, Faction # Import Faction for logging
 
-
+# Basic Token Tracker (can be replaced with a more sophisticated one if needed)
 class TokenTracker:
     def __init__(self):
-        self.usage = {}
+        self.usage: Dict[str, Dict[str, int]] = {} # agent_name -> {"input": X, "output": Y}
 
-    def update(self, *args, **kwargs):
-        pass
+    def update(self, agent_name: str, input_tokens: int = 0, output_tokens: int = 0):
+        if agent_name not in self.usage:
+            self.usage[agent_name] = {"input": 0, "output": 0}
+        self.usage[agent_name]["input"] += input_tokens
+        self.usage[agent_name]["output"] += output_tokens
 
     def to_dict(self) -> Dict[str, Dict[str, int]]:
-        return self.usage
+        return dict(self.usage)
 
-
+# Configuration Loading (Simple placeholder)
 def load_config_from_file(path: str) -> Dict:
-    print(f"Attempting to load config from {path} (stub).")
-    return {}
+    """Loads game configuration from a JSON file."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+            print(f"Successfully loaded configuration from {path}")
+            return config
+    except FileNotFoundError:
+        print(f"Warning: Configuration file not found at {path}. Using default settings.")
+        return {}
+    except json.JSONDecodeError:
+        print(f"Warning: Error decoding JSON from {path}. Using default settings.")
+        return {}
+    except Exception as e:
+        print(f"Warning: An unexpected error occurred loading config from {path}: {e}. Using default settings.")
+        return {}
 
 
 def create_players_from_config(config: Dict) -> List[Player]:
-    players = []
+    """Creates Player objects with assigned roles and agents based on the config."""
+    players: List[Player] = []
     roles_config = config.get("roles", [])
-    if not roles_config:
-        roles_setup = [
-            ("Player1", "Cop"),
-            ("Player2", "Doctor"),
-            ("Player3", "Villager"),
-            ("Player4", "Godfather"),
-            ("Player5", "Goon")
-        ]
-        print("Warning: Using default 5-player role setup.")
-    else:
-        roles_setup = [(entry["name"], entry["role"]) for entry in roles_config]
 
-    for name, role_name in roles_setup:
+    # Default setup if no roles are specified in config
+    if not roles_config:
+        print("Warning: No roles specified in config. Using default 5-player setup (Cop, Doctor, Villager, Godfather, Goon).")
+        roles_config = [
+            {"name": "Player1", "role": "Cop"},
+            {"name": "Player2", "role": "Doctor"},
+            {"name": "Player3", "role": "Villager"},
+            {"name": "Player4", "role": "Godfather"},
+            {"name": "Player5", "role": "Goon"}
+        ]
+        # Default agent mapping if none provided for the default roles
+        if "agent_mapping" not in config:
+             config["agent_mapping"] = {p["name"]: "rule" for p in roles_config}
+             config["agent_mapping"]["Player1"] = "llm" # Example: Make Player1 an LLM by default
+             config["agent_mapping"]["Player4"] = "llm" # Example: Make Player4 an LLM by default
+
+    # Create players and assign agents
+    agent_mapping = config.get("agent_mapping", {})
+    llm_agent_config = config.get("llm_agent_config", {}) # Global LLM agent config
+    rule_agent_strategy = config.get("rule_agent_strategy", {}) # Global Rule agent strategy
+
+    for role_entry in roles_config:
+        name = role_entry.get("name")
+        role_name = role_entry.get("role")
+        if not name or not role_name:
+            print(f"Warning: Skipping invalid role entry in config: {role_entry}")
+            continue
+
         RoleClass = get_role_class(role_name)
         if not RoleClass:
-            raise ValueError(f"Unknown role name '{role_name}' in configuration.")
+            print(f"Error: Unknown role name '{role_name}' for player {name}. Skipping.")
+            # Or raise ValueError(f"Unknown role name '{role_name}'...")
+            continue
         role_instance = RoleClass()
-        player = Player(name=name, role=role_instance)
+        player = Player(name=name, role=role_instance) # Create the player first
 
-        agent_type = config.get("agent_mapping", {}).get(name, "rule").lower()
+        # Determine agent type for this player
+        agent_type = agent_mapping.get(name, "rule").lower() # Default to rule-based if not specified
+
+        # Create the agent instance
         if agent_type == "llm":
-            model_name = config.get("llm_config", {}).get("model", "gpt-3.5-turbo")
-            system_prompt = (
-                f"You are {name}, playing Mafia as {role_instance.name}. "
-                f"{role_instance.get_role_description()}"
-            )
-
-            def dummy_model_backend(prompt: str) -> str:
-                return '{"action": "pass"}'
+            # Pass the specific player's name and potentially override global LLM config
+            agent_specific_config = llm_agent_config.copy() # Start with global config
+            agent_specific_config.update(role_entry.get("agent_config", {})) # Layer role-specific config
+            # Ensure backend_type is set, default to dummy if needed
+            if "backend_type" not in agent_specific_config:
+                 agent_specific_config["backend_type"] = "dummy"
 
             agent = LLMAgent(
                 name=name,
-                model_backend=dummy_model_backend,
-                tokenizer=None,
-                config={"system_prompt": system_prompt, "model": model_name}
+                config=agent_specific_config # Pass the combined config
             )
-            print(f"Assigning LLM-based Agent to {name} ({role_name})")
-        else:
-            strategy = config.get("agent_strategy", {})
-            agent = RuleAgent(name=name, role=role_instance.name, strategy=strategy)
-            print(f"Assigning RuleAgent to {name} ({role_name})")
+            print(f"  - Assigning LLMAgent ({agent.backend_type}/{agent.model_identifier}) to {name} ({role_name})")
+        else: # Default to RuleAgent
+            agent_specific_strategy = rule_agent_strategy.copy()
+            agent_specific_strategy.update(role_entry.get("agent_strategy", {}))
+            agent = RuleAgent(
+                name=name,
+                role=role_instance.name, # Pass the role name for rule logic
+                strategy=agent_specific_strategy
+             )
+            print(f"  - Assigning RuleAgent to {name} ({role_name})")
 
-        player.agent = agent
+        player.agent = agent # Assign the created agent to the player
         players.append(player)
+
+    if not players:
+         raise ValueError("No valid players could be created from the configuration.")
 
     return players
 
 
-def log_game_summary(game_state) -> Dict:
-    return {
+def log_game_summary(game_state, token_tracker: TokenTracker) -> Dict:
+    """Creates a dictionary summarizing the completed game's results."""
+    summary = {
         "game_id": game_state.game_id,
-        "winner": game_state.winner.value if game_state.winner else None,
+        "winner": game_state.winner.value if game_state.winner else "UNDECIDED",
         "final_roles": game_state.final_player_roles,
-        "day_count": game_state.day_count
+        "day_count": game_state.day_count,
+        "total_steps": game_state.turn_number_in_phase, # Or track total steps separately
+        "game_over_phase": game_state.phase.name,
+        "alive_at_end": sorted(list(game_state.alive_players)),
+        "dead_at_end": sorted(list(game_state.dead_players)),
+        "token_usage": token_tracker.to_dict(),
+        # Consider adding full message log or hidden log if needed for detailed analysis
+        # "messages": [msg.to_dict() for msg in game_state.messages],
+        # "hidden_log": list(game_state.hidden_log),
     }
-
-
-def run_simulation(game_config: Dict, agent_config: Dict) -> Dict:
-    print(f"\n--- Starting Simulation Game ID: {game_config.get('game_id', 'N/A')} ---")
-    combined_config = {**game_config, "agents": agent_config}
-
-    players = create_players_from_config(combined_config)
-    env = MafiaEnvironment(players=players, config=combined_config)
-
-    if env.state.phase != GamePhase.NIGHT:
-        env.state.phase = GamePhase.NIGHT
-    print("Game begins at Night (Day 0). Agents may converse/pass; initial kills occur here if applicable.")
-
-    token_tracker = TokenTracker()
-    max_steps = combined_config.get("max_steps", 100)
-    step_count = 0
-
-    while not env.state.game_over and step_count < max_steps:
-        step_count += 1
-        print(f"\n=== [Step {step_count}] Day {env.state.day_count}, Phase: {env.state.phase.name}, Turn: {env.state.turn_number_in_phase} ===")
-
-        current_phase = env.state.phase
-        current_player_name = env.get_current_player_name()
-
-        # Final vote is non-turn-based: every alive player votes
-        if current_phase == GamePhase.FINAL_VOTE:
-            for name in env.state.alive_players:
-                player = env.state.get_player(name)
-                if not player or not player.alive:
-                    continue
-                obs = env.get_observation(name)
-                player.agent.observe(obs)
-                act = player.agent.act()
-                print(f"{name} votes: {act}")
-                env.process_player_action(name, act)
-            env.step_phase()
-            continue
-
-        # Other phases
-        if not current_player_name:
-            print("No current player; environment resolving phase...")
-            env.step_phase()
-            continue
-
-        player = env.state.get_player(current_player_name)
-        if not player or not player.alive:
-            print(f"Skipping turn for {current_player_name} (dead or invalid).")
-            env.advance_turn()
-            continue
-
-        observation = env.get_observation(current_player_name)
-        agent = player.agent
-        agent.observe(observation)
-        agent_action = agent.act()
-        print(f"{current_player_name} (role={player.role.name}) chooses: {agent_action}")
-
-        success = env.process_player_action(current_player_name, agent_action)
-        if not success:
-            print(f"Action failed or was invalid: {agent_action}")
-        else:
-            env.advance_turn()
-
-    print("\n=== Game Over ===")
-    winner_str = env.state.winner.value if env.state.winner else "No winner / Undecided"
-    print(f"Winner: {winner_str}")
-    print(f"Ended on Day {env.state.day_count}, Phase: {env.state.phase.name}")
-
-    summary = log_game_summary(env.state)
-    summary["tokens_used"] = token_tracker.to_dict()
     return summary
 
 
-def run_multiple_simulations(num_games: int = 5,
-                             config_path: str = "config/default_game.json",
+def run_simulation(game_config: Dict, agent_config: Optional[Dict]=None) -> Dict:
+    """Runs a single game simulation from start to finish."""
+
+    # --- Setup ---
+    sim_id = game_config.get("game_id", str(uuid.uuid4()))
+    print(f"\n--- Starting Mafia Simulation [ID: {sim_id}] ---")
+
+    # Merge game_config and agent_config (agent_config is now primarily for LLMs)
+    # The primary way to configure agents is now within the "roles" list in game_config
+    # or using global configs like "llm_agent_config" and "rule_agent_strategy".
+    combined_config = game_config.copy()
+    if agent_config: # For backward compatibility or global overrides
+        combined_config["llm_agent_config"] = {**combined_config.get("llm_agent_config", {}), **agent_config}
+
+
+    print("Creating players and agents...")
+    try:
+        players = create_players_from_config(combined_config)
+    except ValueError as e:
+        print(f"Error setting up players: {e}")
+        return {"game_id": sim_id, "status": "error", "message": str(e)}
+
+    print("Initializing environment...")
+    env = MafiaEnvironment(players=players, config=combined_config)
+    env.state.game_id = sim_id # Ensure game state uses the provided ID
+
+    token_tracker = TokenTracker() # Initialize token tracker
+    max_steps = combined_config.get("max_steps", 150) # Sensible default max steps
+    step_count = 0
+    action_log = [] # Store (step, player, action) tuples
+
+    print(f"Game starting... Max steps: {max_steps}")
+    env.state.log_message("system", f"Simulation Start. Max steps: {max_steps}", msg_type="system")
+
+    # --- Simulation Loop ---
+    while not env.state.game_over and step_count < max_steps:
+        step_count += 1
+        current_phase = env.state.phase
+        current_player_name = env.get_current_player_name() # Might be None
+
+        print(f"\n>>> [Step {step_count}/{max_steps}] Day {env.state.day_count} | Phase: {current_phase.name} | Turn: {env.state.turn_number_in_phase} | Player: {current_player_name or 'System'} <<<")
+
+        # --- Handle Phase Transitions / System Actions ---
+        if current_player_name is None and current_phase not in {GamePhase.FINAL_VOTE, GamePhase.GAME_OVER}:
+            # Environment needs to resolve something (e.g., night actions) or transition phase
+            print("System turn: Resolving phase actions or transitioning...")
+            phase_ended_game = env.step_phase() # step_phase advances state and returns True if game ends
+            if phase_ended_game:
+                 print("Game ended during system resolution.")
+                 break
+            continue # Move to next step after system action
+
+        # --- Handle Player Actions ---
+        active_players_in_phase: List[str] = []
+        if current_phase == GamePhase.NIGHT:
+             # All players with night actions act 'simultaneously' (submit actions)
+             active_players_in_phase = [p.name for p in players if p.alive and p.can_act_at_night()]
+             if not active_players_in_phase:
+                  print("No players with night actions this night.")
+                  env.step_phase() # Resolve night immediately
+                  continue
+        elif current_phase == GamePhase.FINAL_VOTE:
+             # All alive players vote
+             active_players_in_phase = list(env.state.alive_players)
+             if not active_players_in_phase:
+                  print("No alive players to conduct final vote.")
+                  env.step_phase()
+                  continue
+        elif current_phase == GamePhase.DEFENSE:
+             # Only the player on trial acts
+             if env.state.player_on_trial and env.state.is_alive(env.state.player_on_trial):
+                  active_players_in_phase = [env.state.player_on_trial]
+             else:
+                   print(f"Player on trial ({env.state.player_on_trial}) not available for defense.")
+                   env.step_phase() # Move to final vote
+                   continue
+        elif current_phase == GamePhase.DAY_DISCUSSION:
+             # Only the current player acts
+             if current_player_name and env.state.is_alive(current_player_name):
+                 active_players_in_phase = [current_player_name]
+             elif current_player_name:
+                  print(f"Skipping turn for {current_player_name} (dead or invalid).")
+                  env.advance_turn() # Advance to next speaker
+                  continue
+             else: # Should have been caught earlier, but safety check
+                  print("Error: Day discussion but no current player turn.")
+                  env.step_phase() # Try to recover
+                  continue
+        elif current_phase == GamePhase.VOTING:
+             # Handle initial voting if implemented - assuming merged into discussion/final vote for now
+             print("Standard voting phase - assuming handled by accusation/final vote logic.")
+             env.step_phase() # Skip this phase if logic isn't distinct
+             continue
+        else: # Game Over or unexpected state
+              print(f"Phase {current_phase.name} does not require player actions or is unexpected.")
+              break # Exit loop if game over
+
+        # --- Process Actions for Active Players ---
+        actions_processed_this_step = 0
+        for p_name in active_players_in_phase:
+            player = env.state.get_player(p_name)
+            if not player or not player.alive:
+                print(f"Skipping action for {p_name} (not found or dead).")
+                continue
+
+            # Get observation for the player
+            observation = env.get_observation(p_name)
+
+            # Agent decision
+            agent = player.agent
+            if not agent:
+                 print(f"Error: Player {p_name} has no assigned agent!")
+                 action = {"action": "pass", "content": "Agent missing."}
+            else:
+                 agent.observe(observation) # Agent sees the state
+                 action = agent.act() # Agent decides action
+
+            print(f"  - {p_name} ({player.role.name} / {player.faction.value}) chose: {action}")
+            action_log.append((step_count, p_name, action)) # Log the chosen action
+
+            # Environment processes the action
+            success = env.process_player_action(p_name, action)
+            if not success:
+                print(f"    -> Action by {p_name} failed or was invalid.")
+                # Optionally, give agent another chance or force pass? For now, just log.
+                env.state.log_hidden(p_name, f"Action failed: {action}")
+
+            actions_processed_this_step += 1
+            # Note: Token tracking would happen within LLMAgent.act() or via callbacks
+
+        # --- Advance Game State After Actions ---
+        if current_phase == GamePhase.NIGHT:
+             # After all night actions are submitted, resolve them and transition
+             print("Resolving night actions...")
+             env.step_phase()
+        elif current_phase == GamePhase.FINAL_VOTE:
+             # After all votes are cast, resolve the lynch and transition
+             print("Resolving final votes...")
+             env.step_phase()
+        elif current_phase == GamePhase.DEFENSE:
+             # After defense statement, transition to final vote
+             print("Defense concluded, moving to final vote...")
+             env.step_phase()
+        elif current_phase == GamePhase.DAY_DISCUSSION:
+              # If the action was successful and didn't trigger an immediate phase change (like accusation)
+              # advance_turn was likely called within process_player_action or should be called if needed.
+              # Check if discussion should end naturally (e.g., everyone passed)
+              if env._check_discussion_end():
+                   print("Discussion round ended.")
+                   env._transition_to_voting() # Check if this leads to game end
+                   if env.state.game_over: break
+        # No explicit advancement needed for other handled phases (they transition within their logic)
+
+
+    # --- End of Simulation ---
+    print("\n" + "="*15 + " Game Over " + "="*15)
+    if step_count >= max_steps:
+        print(f"Simulation ended: Reached max steps ({max_steps}).")
+        env.state.log_message("system", f"Game ended due to reaching max steps ({max_steps}).", msg_type="system")
+        # Ensure game_over is set if not already
+        if not env.state.game_over:
+            env.state.game_over = True
+            env.state.phase = GamePhase.GAME_OVER
+            env.state.winner = None # Mark as undecided/timeout
+
+    winner_faction = env.state.winner
+    winner_str = winner_faction.value.upper() if winner_faction else "UNDECIDED (Timeout or Draw)"
+    print(f"Winner: {winner_str}")
+    print(f"Ended on Day {env.state.day_count}, Phase: {env.state.phase.name}")
+    print(f"Final Roles: {env.state.final_player_roles}")
+    print(f"Final Alive: {sorted(list(env.state.alive_players))}")
+
+    # Generate and return summary
+    summary = log_game_summary(env.state, token_tracker)
+    # summary["action_log"] = action_log # Optionally include detailed action log
+
+    print(f"--- Simulation Complete [ID: {sim_id}] ---")
+    return summary
+
+
+def run_multiple_simulations(num_games: int = 3, # Reduced default for quicker testing
+                             config_path: Optional[str] = None, # Make config path optional
+                             base_config: Optional[Dict] = None, # Allow passing config directly
                              save_dir: str = "output/sim_results"):
-    os.makedirs(save_dir, exist_ok=True)
-    base_game_config = load_config_from_file(config_path)
-    if not base_game_config:
-        base_game_config = {
-            "roles": [
-                {"name": "Player1", "role": "Cop"},
-                {"name": "Player2", "role": "Doctor"},
-                {"name": "Player3", "role": "Villager"},
-                {"name": "Player4", "role": "Godfather"},
-                {"name": "Player5", "role": "Goon"}
-            ],
-            "agent_mapping": {
-                "Player1": "llm",
-                "Player4": "llm"
-            },
-            "llm_config": {"model": "gpt-3.5-turbo"},
-            "max_steps": 100
-        }
-    base_agent_config = {}
+    """Runs multiple simulations and saves the results."""
+
+    if not config_path and not base_config:
+         print("Error: Must provide either a config_path or a base_config dictionary.")
+         return
+
+    if config_path and not base_config:
+         print(f"Loading base configuration from: {config_path}")
+         base_game_config = load_config_from_file(config_path)
+         if not base_game_config: # Fallback if loading fails
+              print("Using minimal default config for testing.")
+              base_game_config = {
+                   "roles": [{"name": f"P{i}", "role": "Villager"} for i in range(1, 6)],
+                   "agent_mapping": {f"P{i}": "rule" for i in range(1, 6)},
+                   "max_steps": 50
+              }
+    elif base_config:
+         print("Using provided base configuration dictionary.")
+         base_game_config = base_config
+    else: # Both provided, maybe prefer direct config?
+         print("Using provided base configuration dictionary (config_path ignored).")
+         base_game_config = base_config
+
+
+    # Ensure save directory exists
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+        log_file = os.path.join(save_dir, "mafia_games_log.jsonl")
+        print(f"Results will be saved to: {log_file}")
+    except OSError as e:
+        print(f"Error creating save directory '{save_dir}': {e}. Results will not be saved.")
+        log_file = None
+
 
     game_results = []
-    log_file = os.path.join(save_dir, "games_log.jsonl")
+    error_count = 0
 
-    for _ in tqdm(range(num_games), desc="Simulating Games"):
-        game_id = str(uuid.uuid4())
-        current_game_config = {**base_game_config, "game_id": game_id}
+    print(f"\nRunning {num_games} Mafia simulations...")
+    for i in tqdm(range(num_games), desc="Simulating Games"):
+        game_id = f"sim_{i+1}_{str(uuid.uuid4())[:8]}" # Unique ID for each game run
+        current_game_config = {**base_game_config, "game_id": game_id} # Add unique ID
+        result = {}
         try:
-            result = run_simulation(current_game_config, base_agent_config)
-            result["game_id"] = game_id
+            # Run the simulation - agent_config is now part of game_config
+            result = run_simulation(game_config=current_game_config)
+            result["status"] = "completed"
             game_results.append(result)
-            with open(log_file, "a", encoding="utf-8") as f:
-                json.dump(result, f)
-                f.write("\n")
         except Exception as e:
-            print(f"\n!!!!!! Error during simulation {game_id} !!!!!!")
+            print(f"\n!!!!!! Critical Error during simulation {game_id} !!!!!!")
+            import traceback
+            traceback.print_exc() # Print detailed traceback
             print(f"Error: {e}")
-            error_info = {"game_id": game_id, "status": "error", "error_message": str(e)}
-            with open(log_file, "a", encoding="utf-8") as f:
-                json.dump(error_info, f)
-                f.write("\n")
+            result = {"game_id": game_id, "status": "error", "error_message": str(e)}
+            error_count += 1
+            # Optionally save error info
+            game_results.append(result) # Add error result to list
 
-    print(f"\n=== Simulations Complete ===\nSaved {len(game_results)} game logs to {log_file}")
+        # Save result incrementally to log file if possible
+        if log_file:
+            try:
+                with open(log_file, "a", encoding="utf-8") as f:
+                    # Convert Enum members in winner field to string before saving
+                    if 'winner' in result and isinstance(result['winner'], Faction):
+                         result['winner'] = result['winner'].value
+                    json.dump(result, f)
+                    f.write("\n")
+            except IOError as e:
+                 print(f"\nWarning: Could not write to log file {log_file}: {e}")
+                 # Maybe disable logging for future iterations if it keeps failing?
+                 # log_file = None
+            except TypeError as e:
+                 print(f"\nWarning: Could not serialize result for {game_id} to JSON: {e}")
+                 print(f"Problematic result data: {result}")
 
+
+    # --- Final Summary ---
+    completed_games = len(game_results) - error_count
+    print(f"\n=== Multi-Simulation Complete ===")
+    print(f"Total Simulations Run: {num_games}")
+    print(f"Successfully Completed: {completed_games}")
+    print(f"Errors Encountered: {error_count}")
+    if log_file and completed_games > 0:
+        print(f"Results saved to: {log_file}")
+    elif log_file and error_count > 0:
+         print(f"Error details saved to: {log_file}")
+
+
+    # Optional: Basic aggregate stats
+    if completed_games > 0:
+        winners = [g["winner"] for g in game_results if g.get("status") == "completed" and g.get("winner")]
+        if winners:
+            from collections import Counter
+            win_counts = Counter(winners)
+            print("\nFaction Win Distribution:")
+            for faction, count in win_counts.items():
+                 print(f"  - {faction}: {count} wins ({count/completed_games:.1%})")
 
 def main():
-    run_multiple_simulations(num_games=3)
+    """Main entry point for running simulations."""
+    # Example: Run 3 games using a configuration file
+    # Ensure 'config/default_game.json' exists or change the path
+    # config_file = "config/default_game.json"
+    # if not os.path.exists(config_file):
+    #     print(f"Warning: Config file '{config_file}' not found. Create one or use direct config.")
+    #     # Minimal config if file doesn't exist
+    #     default_config = {
+    #         "roles": [{"name": "P1", "role": "Cop", "agent_mapping": "llm"}, {"name": "P2", "role": "Goon", "agent_mapping":"rule"}],
+    #         "llm_agent_config": {"backend_type": "dummy"},
+    #         "max_steps": 30
+    #     }
+    #     run_multiple_simulations(num_games=2, base_config=default_config, save_dir="output/test_dummy_sims")
+    # else:
+    #      run_multiple_simulations(num_games=3, config_path=config_file, save_dir="output/default_sims")
+
+    # Example: Run directly with a config dictionary
+    print("\nRunning simulation with direct config...")
+    direct_config = {
+            "roles": [
+                {"name": "Alice",   "role": "Cop"},
+                {"name": "Bob",     "role": "Doctor"},
+                {"name": "Charlie", "role": "Villager"},
+                {"name": "David",   "role": "Villager"},
+                {"name": "Eve",     "role": "Villager"},
+                {"name": "Heidi",   "role": "Godfather"},
+                {"name": "Ivan",    "role": "Goon"},
+                {"name": "Judy",    "role": "Goon"}
+            ],
+            "agent_mapping": { # Make Alice (Cop) and Heidi (GF) LLMs, others rules
+                "Alice": "llm", "Bob": "rule", "Charlie": "rule", "David": "rule",
+                "Eve": "rule", "Heidi": "llm", "Ivan": "rule", "Judy": "rule"
+            },
+            "llm_agent_config": { # Config for ALL LLM agents in this game
+                 "backend_type": "dummy", # Change to "openai", "local_api" etc.
+                 "model_identifier": "dummy-model",
+                 #"api_key_env_var": "OPENAI_API_KEY", # If using OpenAI
+                 #"local_api_endpoint": "http://localhost:11434/v1/chat/completions", # If using Ollama
+                 "use_cot": False, # Enable Chain-of-Thought?
+                 "generation_params": {"temperature": 0.6, "max_tokens": 200}
+            },
+             "rule_agent_strategy": { # Config for ALL Rule agents
+                  "always_accuse": False, # Make rules less aggressive
+                  "always_vote_guilty": False,
+                  "always_vote_innocent": False,
+             },
+            "max_steps": 100,
+            "lynch_defense_enabled": True,
+            "cop_speaks_first": True,
+        }
+    run_multiple_simulations(num_games=1, base_config=direct_config, save_dir="output/direct_config_sim")
 
 
 if __name__ == "__main__":
     main()
-
 
 # === mafia\__init__.py ===
 
@@ -1982,77 +2338,375 @@ class BaseAgent(ABC):
 # === mafia/agents/llm_agent.py ===
 
 import json
-from typing import Dict, Any, Optional
+import os # Added for API key loading
+from typing import Dict, Any, Optional, List
+
+# Import necessary components from the project
 from llm_games.mafia.agents.base_agent import BaseAgent
+from llm_games.mafia.enums import GamePhase # Needed for phase-specific prompts
+
+# Placeholder for actual LLM API clients (e.g., OpenAI, Anthropic, local vLLM/Ollama)
+# You would replace these comments with actual imports and client initialization
+# Example using OpenAI:
+from openai import OpenAI
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# Example using a local model via requests:
+# import requests
+# LOCAL_MODEL_ENDPOINT = "http://localhost:8000/v1/completions" # Example for vLLM/Ollama OpenAI-compatible API
 
 class LLMAgent(BaseAgent):
     """
-    A base LLM-powered agent that can interact with the environment
-    using local or API-based model backends.
+    An LLM-powered agent that interacts with the environment using various model backends.
+    Includes enhanced prompting based on game state and phase.
     """
     def __init__(self,
                  name: str,
-                 model_backend: callable,
-                 tokenizer: Optional[callable] = None,
+                 # model_backend is now simplified, actual logic moved to act/helper
                  config: Optional[Dict[str, Any]] = None):
         """
         :param name: Agent/player name
-        :param model_backend: A callable that takes a string prompt and returns a string
-        :param tokenizer: Optional tokenizer if needed (e.g. for measuring token usage)
-        :param config: Additional config for prompts, temperature, etc.
+        :param config: Configuration dictionary containing:
+                       - model_identifier: (e.g., "gpt-4", "local_ollama_model")
+                       - backend_type: ("openai", "anthropic", "local_api", "dummy")
+                       - system_prompt_base: Base system prompt (optional, built dynamically if not provided)
+                       - api_key_env_var: Environment variable name for API key (e.g., "OPENAI_API_KEY")
+                       - local_api_endpoint: URL for local model inference endpoint
+                       - generation_params: Dict of parameters for LLM generation (temperature, max_tokens, etc.)
+                       - use_cot: Boolean flag to enable Chain-of-Thought prompting hints
         """
         super().__init__(name)
-        self.model_backend = model_backend
-        self.tokenizer = tokenizer
         self.config = config or {}
         self.last_observation: Optional[Dict[str, Any]] = None
+        self.model_identifier = self.config.get("model_identifier", "gpt-3.5-turbo") # Default model
+        self.backend_type = self.config.get("backend_type", "dummy") # Default to dummy
+        self.api_key_env_var = self.config.get("api_key_env_var")
+        self.local_api_endpoint = self.config.get("local_api_endpoint")
+        self.generation_params = self.config.get("generation_params", {"temperature": 0.7, "max_tokens": 150})
+        self.use_cot = self.config.get("use_cot", False) # Default CoT to false
+
+        # --- Initialize Model Backend Client ---
+        # This part needs to be adapted based on the chosen backend_type
+        self.model_client = None
+        if self.backend_type == "openai":
+            # Example: Load OpenAI client
+            # api_key = os.environ.get(self.api_key_env_var)
+            # if not api_key:
+            #     print(f"Warning: OpenAI API key not found in env var '{self.api_key_env_var}' for agent {self.name}")
+            # else:
+            #     # self.model_client = OpenAI(api_key=api_key)
+            #     print(f"OpenAI client initialized for {self.name}")
+            print(f"Placeholder: Initialize OpenAI client for {self.name} using model {self.model_identifier}")
+        elif self.backend_type == "anthropic":
+            # Example: Load Anthropic client
+            # api_key = os.environ.get(self.api_key_env_var)
+            # if not api_key:
+            #     print(f"Warning: Anthropic API key not found in env var '{self.api_key_env_var}' for agent {self.name}")
+            # else:
+            #     # import anthropic
+            #     # self.model_client = anthropic.Anthropic(api_key=api_key)
+            #     print(f"Anthropic client initialized for {self.name}")
+            print(f"Placeholder: Initialize Anthropic client for {self.name} using model {self.model_identifier}")
+        elif self.backend_type == "local_api":
+            if not self.local_api_endpoint:
+                 print(f"Warning: Local API endpoint not configured for agent {self.name}")
+            else:
+                 print(f"Placeholder: Using local API endpoint {self.local_api_endpoint} for {self.name}")
+        elif self.backend_type == "dummy":
+            print(f"Agent {self.name} is using a dummy backend.")
+        else:
+            print(f"Warning: Unknown backend type '{self.backend_type}' for agent {self.name}. Using dummy.")
+            self.backend_type = "dummy"
+        # --- End Backend Initialization ---
+
 
     def observe(self, observation: Dict[str, Any]):
+        """Stores the latest observation from the environment."""
         self.last_observation = observation
 
     def act(self) -> Dict[str, Any]:
+        """Generates an action based on the last observation using the configured LLM backend."""
         if not self.last_observation:
-            return {"action": "pass"}
+            # Should not happen in normal flow, but good practice
+            return {"action": "pass", "content": "No observation received yet."}
 
-        prompt = self.build_prompt(self.last_observation)
-        raw_output = self.model_backend(prompt)
+        # Build the prompt based on the current game phase and observation
+        prompt = self.build_prompt(self.last_observation) # Now uses the enhanced build_prompt
+
+        raw_output = ""
+        try:
+            # --- Call Appropriate Model Backend ---
+            if self.backend_type == "openai" and self.model_client:
+                # response = self.model_client.chat.completions.create(
+                #     model=self.model_identifier,
+                #     messages=[{"role": "system", "content": prompt}], # Simplification, consider history
+                #     **self.generation_params
+                # )
+                # raw_output = response.choices[0].message.content
+                raw_output = '{"action": "speak", "content": "Placeholder OpenAI response."}' # Placeholder
+            elif self.backend_type == "anthropic" and self.model_client:
+                 # response = self.model_client.messages.create(
+                 #    model=self.model_identifier,
+                 #    system=prompt, # Anthropic uses 'system' parameter
+                 #    messages=[{"role": "user", "content": "What is your action?"}], # Example user message
+                 #    **self.generation_params
+                 # )
+                 # raw_output = response.content[0].text
+                 raw_output = '{"action": "vote", "target": "Bob", "vote_type": "final_guilty"}' # Placeholder
+            elif self.backend_type == "local_api" and self.local_api_endpoint:
+                # Example using requests for an OpenAI-compatible local API
+                # headers = {"Content-Type": "application/json"}
+                # if self.api_key_env_var: # If local API needs a key (e.g., LM Studio)
+                #      headers["Authorization"] = f"Bearer {os.environ.get(self.api_key_env_var, 'dummy-key')}"
+                # payload = {
+                #     "model": self.model_identifier,
+                #     "messages": [{"role": "system", "content": prompt}],
+                #     **self.generation_params
+                # }
+                # response = requests.post(self.local_api_endpoint, headers=headers, json=payload)
+                # response.raise_for_status() # Raise exception for bad status codes
+                # raw_output = response.json()["choices"][0]["message"]["content"]
+                 raw_output = '{"action": "night_action", "target": "Charlie"}' # Placeholder
+            else: # Dummy backend
+                raw_output = '{"action": "pass", "content": "Dummy agent takes a pass."}'
+             # --- End Backend Call ---
+
+        except Exception as e:
+            print(f"Error during model inference for agent {self.name} (Backend: {self.backend_type}): {e}")
+            # Fallback to a safe action like "pass" on error
+            raw_output = '{"action": "pass", "content": "Error during generation."}'
+
+        # Parse the LLM's raw output into a structured action dictionary
         action = self.parse_action(raw_output)
         return action
 
+    def _format_player_list(self, obs: Dict[str, Any]) -> List[str]:
+        """Formats the player list with status tags based on observation."""
+        player_list_str = []
+        all_players = obs.get("player_list", []) # Use the pre-formatted list from game_state
+        
+        # Fallback if player_list isn't provided directly
+        if not all_players:
+             alive = obs.get("alive_players", [])
+             dead = obs.get("dead_players", [])
+             on_trial = obs.get("player_on_trial")
+             # Note: Mafia visibility would require more logic here if building from scratch
+             for p_name in sorted(list(set(alive + dead))):
+                  tags = []
+                  if p_name in dead: tags.append("DEAD")
+                  if p_name == on_trial: tags.append("On Trial")
+                  # Mafia tag would need player object access - simplified here
+                  status_str = f" [{', '.join(tags)}]" if tags else ""
+                  player_list_str.append(f"{p_name}{status_str}")
+        else:
+            player_list_str = all_players # Use the already formatted list
+
+        return player_list_str
+
+
     def build_prompt(self, obs: Dict[str, Any]) -> str:
         """
-        Convert the environment observation into a textual prompt for the LLM.
-        This method can be customized or replaced with chain-of-thought or JSON-based instructions.
+        Builds a comprehensive system prompt for the LLM agent based on the game state.
+        Introduces the game, summarizes role/faction, describes phase logic,
+        includes player lists, messages, and memory.
         """
-        # A simple example: show the day/phase, who’s alive, last messages, etc.
-        # Then instruct the model to pick an action.
         lines = []
-        lines.append(f"You are {self.name}, playing the game of Mafia.")
-        lines.append(f"Current Phase: {obs.get('phase', 'unknown')}, Day {obs.get('day', 0)}")
-        lines.append("Alive Players: " + ", ".join(obs.get("alive_players", [])))
-        lines.append("Dead Players: " + ", ".join(obs.get("dead_players", [])))
-        lines.append("Recent Messages:")
-        for msg in obs.get("messages", []):
-            lines.append(f"  - {msg}")
-        lines.append("Based on the above, choose your next action in JSON format.")
-        lines.append('Example: {"action": "accuse", "target": "Bob"}')
+
+        # --- Game Introduction & Role ---
+        lines.append("=== Welcome to the Game of Mafia ===")
+        lines.append(f"You are Player: {self.name}")
+        lines.append(f"Your Role: {obs.get('role', 'Unknown Role')}")
+        lines.append(f"Your Faction: {obs.get('faction', 'Unknown Faction').upper()}")
+        lines.append(f"Your Objective: {obs.get('role_description', 'Win with your faction.')}")
+        if obs.get('faction', '') == 'mafia' and obs.get('mafia_members', []):
+             lines.append(f"Your Mafia Teammates (Alive): {', '.join(obs.get('mafia_members', []))}")
+
+        # --- Current Game State ---
+        lines.append("\n=== Current Game State ===")
+        current_phase_str = obs.get('phase', 'unknown').replace('_', ' ').title()
+        lines.append(f"Current Phase: {current_phase_str} (Day {obs.get('day', 0)})")
+        if obs.get('is_current_turn', False):
+             lines.append("It is currently YOUR TURN to act.")
+        else:
+             lines.append(f"It is currently {obs.get('current_player_turn', 'Someone')}'s turn.")
+
+        # --- Player List ---
+        lines.append("\n=== Players ===")
+        player_list_formatted = self._format_player_list(obs)
+        lines.extend([f"- {p}" for p in player_list_formatted])
+        if obs.get('player_on_trial'):
+            lines.append(f"Player on Trial: {obs.get('player_on_trial')}")
+
+
+        # --- Recent Messages ---
+        lines.append("\n=== Recent Messages (Last 20) ===")
+        messages = obs.get("messages", [])
+        if messages:
+             lines.extend([f"- {msg}" for msg in messages])
+        else:
+             lines.append("- No messages yet in this phase.")
+
+        # --- Memory / Known Information ---
+        # Display investigation results, role peeks, etc.
+        memory = obs.get("memory", [])
+        if memory:
+             lines.append("\n=== Your Private Memory ===")
+             for mem_item in memory:
+                  if mem_item.get("type") == "investigation_result":
+                       lines.append(f"- Day {mem_item.get('day')}: Investigated {mem_item.get('target')} - Faction: {mem_item.get('result').upper()}")
+                  elif mem_item.get("type") == "role_peek":
+                        lines.append(f"- Day {mem_item.get('day')}: Saw {mem_item.get('target')}'s role - Role: {mem_item.get('role')}")
+                  # Add other memory types as needed
+                  else:
+                       lines.append(f"- {mem_item}") # Generic display
+
+        # --- Phase-Specific Instructions & Action Format ---
+        lines.append("\n=== Your Task ===")
+        current_phase_enum = GamePhase(obs.get('phase')) if obs.get('phase') in GamePhase._value2member_map_ else None
+
+        # Use helper for phase-specific instructions
+        phase_instructions = self._get_phase_instructions(current_phase_enum, obs)
+        lines.extend(phase_instructions)
+
+        # Add CoT hint if enabled
+        if self.use_cot:
+             lines.append("\nThink step-by-step about your goal, the current situation, potential threats/allies, and your best action. Then, provide your final action in the specified JSON format.")
+
+        lines.append("\nOutput ONLY the JSON for your chosen action. Do not include any other text, explanation, or reasoning outside the JSON structure.")
+        lines.append('Example JSON format: {"action": "ACTION_TYPE", "target": "PLAYER_NAME", "content": "Your message here", "vote_type": "GUILTY/INNOCENT"}')
+        lines.append("Include ONLY the necessary fields for your chosen action type.")
 
         return "\n".join(lines)
 
+
+    def _get_phase_instructions(self, phase: Optional[GamePhase], obs: Dict[str, Any]) -> List[str]:
+        """ Provides specific instructions based on the current game phase. """
+        instructions = []
+        alive_players = obs.get("alive_players", [])
+        valid_targets = [p for p in alive_players if p != self.name] # General valid targets
+
+        if phase == GamePhase.NIGHT:
+            instructions.append("It is Night. Choose your night action if applicable.")
+            if obs.get('can_act_tonight', False):
+                instructions.append("Select your target from the list of alive players.")
+                instructions.append(f"Valid Targets: {', '.join(valid_targets) or 'None'}")
+                instructions.append('Action JSON: {"action": "night_action", "target": "PLAYER_NAME"}')
+            else:
+                instructions.append("You have no action this night.")
+                instructions.append('Action JSON: {"action": "pass"}')
+        elif phase == GamePhase.DAY_DISCUSSION:
+            instructions.append("It is the Day Discussion phase.")
+            if obs.get('is_current_turn', False):
+                 if obs.get("can_speak", True):
+                     instructions.append("It's your turn to speak, accuse, question, or pass.")
+                     instructions.append(" - To speak: {'action': 'speak', 'content': 'Your message...'}")
+                     # Allow accusation only if no one is on trial and not Day 0
+                     if not obs.get("player_on_trial") and obs.get("day", 0) > 0:
+                         instructions.append(" - To accuse: {'action': 'accuse', 'target': 'PLAYER_NAME'}")
+                     instructions.append(" - To question: {'action': 'question', 'target': 'PLAYER_NAME', 'content': 'Your question...'}")
+                     # Add other actions like predict, whisper if implemented fully
+                     instructions.append(" - To pass: {'action': 'pass'}")
+                     instructions.append(f"Valid Targets for accuse/question: {', '.join(valid_targets) or 'None'}")
+                 else:
+                     instructions.append("You cannot speak this turn (e.g., blackmailed). You must pass.")
+                     instructions.append('Action JSON: {"action": "pass"}')
+            else:
+                 instructions.append("It is not your turn. You cannot act now.")
+                 # Technically agent shouldn't be asked to act if not its turn, but good to handle.
+                 instructions.append('Action JSON: {"action": "pass"}') # Default safe action
+        elif phase == GamePhase.VOTING:
+             # This phase might be skipped or merged depending on config, but handle it
+             instructions.append("It is the initial Voting Phase.")
+             if obs.get("player_on_trial"):
+                 instructions.append(f"You are voting on whether to proceed to a final trial for {obs.get('player_on_trial')}.")
+                 instructions.append(" - To vote for trial: {'action': 'vote', 'target': 'PLAYER_ON_TRIAL_NAME'}") # Target is the accused
+                 instructions.append(" - To skip/abstain: {'action': 'skip'}")
+             else:
+                 instructions.append("No one is currently on trial. This phase should transition.")
+                 instructions.append('Action JSON: {"action": "pass"}')
+        elif phase == GamePhase.DEFENSE:
+             instructions.append("It is the Defense Phase.")
+             if obs.get("player_on_trial") == self.name:
+                 instructions.append("You are on trial! Speak in your defense.")
+                 instructions.append('Action JSON: {"action": "speak", "content": "Your defense statement..."}')
+             else:
+                 instructions.append(f"{obs.get('player_on_trial')} is giving their defense. Wait for the Final Vote.")
+                 instructions.append('Action JSON: {"action": "pass"}') # Cannot act if not on trial
+        elif phase == GamePhase.FINAL_VOTE:
+             instructions.append("It is the Final Vote Phase.")
+             accused = obs.get('player_on_trial')
+             if accused:
+                instructions.append(f"Vote whether {accused} is GUILTY or INNOCENT.")
+                instructions.append(" - Vote Guilty: {'action': 'vote', 'vote_type': 'final_guilty'}")
+                instructions.append(" - Vote Innocent: {'action': 'vote', 'vote_type': 'final_innocent'}")
+                # Optional Abstain:
+                # instructions.append(" - Abstain: {'action': 'vote', 'vote_type': 'abstain'}")
+             else:
+                instructions.append("Error: Final Vote phase but no player on trial.")
+                instructions.append('Action JSON: {"action": "pass"}')
+        elif phase == GamePhase.GAME_OVER:
+             instructions.append("The game is over.")
+             winner = obs.get("winner")
+             instructions.append(f"Winner: {winner.upper() if winner else 'Undecided'}")
+             instructions.append('Action JSON: {"action": "pass"}') # No actions possible
+        else: # Fallback
+             instructions.append("Unknown game phase. Please pass.")
+             instructions.append('Action JSON: {"action": "pass"}')
+
+        return instructions
+
+
     def parse_action(self, response: str) -> Dict[str, Any]:
         """
-        Try to parse the LLM’s output as JSON. If parsing fails or fields are missing,
-        default to {"action": "pass"}.
+        Attempts to parse the LLM's JSON output.
+        Handles potential errors and defaults to a safe 'pass' action.
         """
         try:
-            data = json.loads(response)
-            # Validate minimal structure
-            if "action" not in data:
-                return {"action": "pass"}
-            return data
-        except json.JSONDecodeError:
-            return {"action": "pass"}
+            # Clean up potential markdown code blocks or leading/trailing text
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0].strip()
+            elif response.startswith("{") and response.endswith("}"):
+                 response = response.strip()
+            else:
+                 # Try to find JSON within the response if it's not clean
+                 start = response.find('{')
+                 end = response.rfind('}')
+                 if start != -1 and end != -1 and end > start:
+                      response = response[start:end+1]
+                 else:
+                      # If still no valid JSON structure found, raise error
+                      raise json.JSONDecodeError("No valid JSON object found in the response.", response, 0)
 
+
+            # Parse the cleaned JSON string
+            data = json.loads(response)
+
+            # Basic validation: 'action' field is mandatory
+            if "action" not in data or not isinstance(data["action"], str):
+                print(f"Warning: LLM response for {self.name} missing 'action' field or invalid type. Raw: {response}")
+                return {"action": "pass", "content": "Invalid action format received."}
+
+            # Sanitize action dictionary (e.g., remove unexpected fields if necessary)
+            # valid_keys = {"action", "target", "content", "vote_type"}
+            # action_data = {k: v for k, v in data.items() if k in valid_keys}
+
+            return data # Return the parsed (and potentially sanitized) action
+
+        except json.JSONDecodeError as e:
+            print(f"Error parsing JSON response for agent {self.name}: {e}")
+            print(f"Raw response: {response}")
+            # Fallback to pass on JSON errors
+            return {"action": "pass", "content": "Failed to parse response."}
+        except Exception as e: # Catch other potential errors
+             print(f"Unexpected error parsing action for {self.name}: {e}")
+             print(f"Raw response: {response}")
+             return {"action": "pass", "content": "Unexpected error processing response."}
+
+    def reset(self):
+        """Resets the agent's state for a new game."""
+        self.last_observation = None
+        # Potentially clear conversation history if maintained internally
+        print(f"Agent {self.name} reset for new game.")
 
 # === mafia\agents\rule_agent.py ===
 import random

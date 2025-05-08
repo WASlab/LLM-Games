@@ -17,8 +17,25 @@ def assign_endgame_rewards(game_state) -> Dict[str, float]:
     return rewards
 
 
-def assign_predict_role_reward(predicted: str, actual: str) -> float:
-    return 0.5 if predicted == actual else -0.25
+def assign_predict_reward(predicter, target_player, game_state) -> float:
+    """
+    One‑off reward for an **accurate** prediction.
+
+    Reward = 1 × (alive_players / initial_players)
+
+    • Encourages *early* correct reads.  
+    • Returns 0 if prediction was wrong or already rewarded.
+    """
+    guess = predicter.predictions.get(target_player.name)
+    if not guess:
+        return 0.0
+    if guess.lower() != target_player.role.name.lower():
+        return 0.0
+
+    alive   = len(game_state.alive_players)
+    initial = len(game_state.players)
+    return max(alive / initial, 0.1)   # floor at 0.1 so late reads still matter
+
 
 
 def assign_vote_reward(voter, target, game_state) -> float:
@@ -56,3 +73,4 @@ def assign_question_reward(asker, target, game_state) -> float:
     if asker.faction == Faction.TOWN and target.faction == Faction.MAFIA:
         return 0.4
     return 0.2
+

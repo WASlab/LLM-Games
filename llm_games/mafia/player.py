@@ -135,12 +135,33 @@ class Player:
 
     def predict_role(self, target: str, predicted_role_name: str, game_state: 'GameState') -> bool:
         """
-        Predicts a player's role for internal analysis. Can be used to compare against actual role later.
+        Guess another player's role.  Private to the predictor.
+
+        * Mafia may **not** predict fellow mafia.
+        * Investigative roles (e.g. Cop) may not predict someone they've
+          already investigated.
+        * Only one prediction per target.
         """
-        if not self.alive:
+        if not self.alive or target == self.name:
             return False
+
         target_player = game_state.get_player(target)
-        if not target_player:
+        if not target_player or not target_player.alive:
+            return False
+
+        if self.faction == Faction.MAFIA and target_player.faction == Faction.MAFIA:
+            self.log_hidden(game_state, f"Cannot predict mafia teammate {target}.")
+            return False
+
+        investigative = getattr(self.role, "is_investigative", False) or self.role.__class__.__name__ in {"Cop", "Investigator"}
+        if investigative:
+            for mem in self.memory:
+                if mem.get("type") == "investigation" and mem.get("target") == target:
+                    self.log_hidden(game_state, f"Already investigated {target}; cannot predict.")
+                    return False
+
+        if target in self.predictions:
+            self.log_hidden(game_state, f"Already predicted {target}; ignoring duplicate.")
             return False
 
         self.predictions[target] = predicted_role_name

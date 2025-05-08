@@ -21,8 +21,8 @@ except ImportError:
     print("Install it using: pip install google-generativeai")
 
 # Placeholder for other LLM API clients (if needed)
-# from openai import OpenAI
-# import requests
+from openai import OpenAI
+import requests
 
 class LLMAgent(BaseAgent):
     """
